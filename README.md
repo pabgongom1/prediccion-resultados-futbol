@@ -1,6 +1,6 @@
 # Statistical Methods for Football Outcome Prediction
 
-> 🇪🇸 \[Versión en español](README.es.md)
+[Versión en español](README.es.md)
 
 Bachelor's Thesis — Double Degree in Mathematics and Statistics, University of Seville (2024–2025).
 
