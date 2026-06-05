@@ -1,0 +1,2265 @@
+---
+output:
+  pdf_document:
+    keep_tex: true
+    latex_engine: xelatex
+    number_sections: true
+    toc_depth: 3
+    includes:
+      in_header: paqueteplaceins.tex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE)
+```
+
+# Introducción
+
+En este capítulo vamos a ver cómo se aplican en la práctica los modelos estadísticos desarrollados para predecir resultados en el fútbol, utilizando el lenguaje de programación R. Después de haber explicado los conceptos teóricos y metodológicos en los capítulos anteriores, en esta sección se muestra cómo convertir esas ideas en código funcional, aplicándolo a los datos de la liga española de fútbol.
+
+Se detallará el proceso de construcción de los modelos predictivos, tanto para la estimación del número de goles como para la predicción de resultados en formato 1X2. A partir de estos modelos, se llevarán a cabo simulaciones de la temporada 2023/2024 con el fin de generar una predicción de la clasificación final de dicha liga, así como el desarrollo de una estrategia de apuestas basada en los resultados pronosticados.
+
+Este análisis tiene dos vertientes principales:
+
+-   Simulación de la temporada y comparación de las clasificaciones predichas con la tabla de clasificación real de la liga 2023/2024. Esta vertiente se analiza en los modelos que predicen el número de goles, es decir, los basados en Poisson y el random forest de regresión (Modelos 1 a 4).
+-   Estrategia de apuestas, que consiste en apostar una unidad monetaria en cada uno de los partidos de la temporada al resultado predicho por el modelo (formato 1X2). Para evaluar su rentabilidad, se utilizarán las cuotas ofrecidas por la casa de apuestas Bet365, calculando las ganancias o pérdidas obtenidas al final de la temporada. Esta estrategia se aplica utilizando el mejor modelo de Poisson (Modelo 2), así como los modelos 5 y 6, basados en random forest y XGBoost de clasificación, respectivamente.
+
+Todo el trabajo se realiza en el entorno de programación R, el código completo puede consultarse en el anexo.
+
+# Librerías utilizadas
+
+Para la elaboración de este capítulo se ha hecho uso de diversas librerías de R, necesarias para el correcto funcionamiento del código. Entre ellas se encuentran:
+
+-   readr y readxl: utilizadas para la lectura e importación de datos.
+-   kableExtra: empleada para la generación de tablas con formato profesional.
+-   dplyr: fundamental para la manipulación y transformación de datos.
+-   ggplot2: usada para generar gráficos presentables.
+-   caret: para el entrenamiento y validación de los modelos de aprendizaje automático.
+-   randomForest y xgboost: son las encargadas de desarrollar los modelos basados en Random Forest y XGBoost.
+
+```{r}
+library(kableExtra)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(Rcpp)
+library(readxl)
+library(purrr)
+library(lubridate)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(patchwork)
+```
+
+# Depuración de los datos
+
+A partir de los conjuntos de datos ya descritos en el Capítulo 3, en esta sección se lleva a cabo la preparación y limpieza preliminar del primer conjunto antes del desarrollo y evaluación de los modelos. En primer lugar, se cargan y transforman los datos históricos de La Liga correspondientes a las temporadas 2018/2019 a 2022/2023, unificándolos en un único conjunto donde cada fila representa un partido, incluyendo variables clave como los goles del equipo local y visitante, y el resultado final.
+
+Paralelamente, se procesan los datos de la temporada 2023/2024, que contienen las mismas variables mencionadas, además de las cuotas de apuesta ofrecidas por Bet365 para cada posible resultado (1X2). Este último conjunto será utilizado para evaluar tanto las predicciones realizadas como las estrategias de apuesta desarrolladas por los modelos.
+
+Finalmente, se ha definido una función auxiliar *simular_apuesta* que permite calcular la ganancia neta obtenida en función de las predicciones del modelo y las cuotas reales ofrecidas. Dicha función será utilizada en una etapa posterior del análisis.
+
+Todos los pasos anteriores están implementados en los primeros bloques del código, el cual puede consultarse en el anexo.
+
+```{r}
+#library(kableExtra)
+#library(dplyr)
+datos23_24 <- read.csv("C:/Users/pablo/OneDrive/Escritorio/UNIVERSIDAD 24-25/TFG/R/LaLiga23-24.csv")
+datos23_24 <- datos23_24 %>%
+  select(Date, HomeTeam, AwayTeam, FTHG, FTAG)
+
+datos23_24$Date <- as.Date(datos23_24$Date, format = "%d/%m/%Y")
+datos23_24$HomeTeam <- as.factor(datos23_24$HomeTeam)
+datos23_24$AwayTeam <- as.factor(datos23_24$AwayTeam)
+datos23_24$FTHG <- as.numeric(datos23_24$FTHG)
+datos23_24$FTAG <- as.numeric(datos23_24$FTAG)
+
+datos23_24$Resultado <- factor(ifelse(datos23_24$FTHG > datos23_24$FTAG, "Victoria Local", 
+                          ifelse(datos23_24$FTHG < datos23_24$FTAG, "Victoria Visitante", "Empate")))
+colnames(datos23_24) <- c("Fecha", "EquipoLocal", "EquipoVisitante", "GolesLocal", "GolesVisitante", "Resultado")
+
+# Sabemos que hay 6 partidos aplazados que nos darán problemas luego, por lo que cambiamos la verdadera fecha de esos partidos a una fecha en la que se jugó la jornada correspondiente.
+partidos_aplazados <- data.frame(
+  EquipoLocal = c("Ath Madrid", "Mallorca", "Barcelona", "Ath Madrid", "Getafe", "Granada"),
+  EquipoVisitante = c("Sevilla", "Cadiz", "Osasuna", "Vallecano", "Real Madrid", "Valencia"),
+  JornadaReal = c(4, 13, 20, 20, 20, 26),
+  FechaFicticia = as.Date(c("2023-09-03", "2023-11-12", "2024-01-14", "2024-01-14", "2024-01-14", "2024-02-26"))
+)
+
+# Modificamos las fechas de esos partidos
+for (i in 1:nrow(partidos_aplazados)) {
+  idx <- which(datos23_24$EquipoLocal == partidos_aplazados$EquipoLocal[i] &
+               datos23_24$EquipoVisitante == partidos_aplazados$EquipoVisitante[i])
+  if (length(idx) == 1) {
+    datos23_24$Fecha[idx] <- partidos_aplazados$FechaFicticia[i]
+  }
+}
+
+datos23_24 <- datos23_24 %>%
+  arrange(Fecha) %>%
+  mutate(Jornada = rep(1:38, each = 10)) %>%
+  relocate(Jornada, .after = Fecha)
+```
+
+```{r}
+#library(dplyr)
+#library(readr)  
+
+directorio <- "C:/Users/pablo/OneDrive/Escritorio/UNIVERSIDAD 24-25/TFG/R/"
+archivos <- list.files(directorio, pattern = "LaLiga.*\\.csv", full.names = TRUE)
+# Excluimos el archivo de la temporada 23-24
+archivos <- archivos[!grepl("LaLiga23-24.csv", archivos)]
+
+cargar_datos <- function(archivo) {
+  df <- read_csv(archivo, show_col_types = FALSE) %>%
+    select(Date, HomeTeam, AwayTeam, FTHG, FTAG)  
+  
+  df$Date <- as.Date(df$Date, format = "%d/%m/%Y")  
+  df$HomeTeam <- as.factor(df$HomeTeam)  
+  df$AwayTeam <- as.factor(df$AwayTeam)
+  df$FTHG <- as.numeric(df$FTHG)  
+  df$FTAG <- as.numeric(df$FTAG)  
+  
+  return(df)
+}
+
+datos <- bind_rows(lapply(archivos, cargar_datos));
+
+# Añado una columna que indique el resultado del partido
+datos$Resultado <- ifelse(datos$FTHG > datos$FTAG, "Victoria Local", 
+                          ifelse(datos$FTHG < datos$FTAG, "Victoria Visitante", "Empate"))
+datos$Resultado <- as.factor(datos$Resultado)
+colnames(datos) <- c("Fecha", "EquipoLocal", "EquipoVisitante", "GolesLocal", "GolesVisitante", "Resultado")
+```
+
+```{r}
+#library(kableExtra)
+#library(dplyr)
+cuotas_23_24 <- read.csv("C:/Users/pablo/OneDrive/Escritorio/UNIVERSIDAD 24-25/TFG/R/LaLiga23-24.csv")
+
+cuotas_23_24 <- cuotas_23_24 %>%
+  select(Date, HomeTeam, AwayTeam, FTHG, FTAG, B365H, B365D, B365A)
+
+cuotas_23_24$Date <- as.Date(cuotas_23_24$Date, format = "%d/%m/%Y")
+cuotas_23_24$HomeTeam <- as.factor(cuotas_23_24$HomeTeam)
+cuotas_23_24$AwayTeam <- as.factor(cuotas_23_24$AwayTeam)
+cuotas_23_24$FTHG <- as.numeric(cuotas_23_24$FTHG)
+cuotas_23_24$FTAG <- as.numeric(cuotas_23_24$FTAG)
+
+# Añado una columna que indique el resultado del partido
+cuotas_23_24$Resultado <- factor(ifelse(cuotas_23_24$FTHG > cuotas_23_24$FTAG, "Victoria Local", 
+                          ifelse(cuotas_23_24$FTHG < cuotas_23_24$FTAG, "Victoria Visitante", "Empate")))
+
+colnames(cuotas_23_24) <- c("Fecha", "EquipoLocal", "EquipoVisitante", "GolesLocal", "GolesVisitante", "Cuota_Victoria_Local", "Cuota_Empate", "Cuota_Victoria_Visitante", "Resultado")
+
+# Sabemos que hay 6 partidos aplazados que nos darán problemas luego, por lo que cambiamos la verdadera fecha de esos partidos a una fecha en la que se jugó la jornada correspondiente.
+partidos_aplazados <- data.frame(
+  EquipoLocal = c("Ath Madrid", "Mallorca", "Barcelona", "Ath Madrid", "Getafe", "Granada"),
+  EquipoVisitante = c("Sevilla", "Cadiz", "Osasuna", "Vallecano", "Real Madrid", "Valencia"),
+  JornadaReal = c(4, 13, 20, 20, 20, 26),
+  FechaFicticia = as.Date(c("2023-09-03", "2023-11-12", "2024-01-14", "2024-01-14", "2024-01-14", "2024-02-26"))
+)
+
+# Modificamos las fechas de esos partidos
+for (i in 1:nrow(partidos_aplazados)) {
+  idx <- which(cuotas_23_24$EquipoLocal == partidos_aplazados$EquipoLocal[i] &
+               cuotas_23_24$EquipoVisitante == partidos_aplazados$EquipoVisitante[i])
+  if (length(idx) == 1) {
+    cuotas_23_24$Fecha[idx] <- partidos_aplazados$FechaFicticia[i]
+  }
+}
+
+cuotas_23_24 <- cuotas_23_24 %>%
+  arrange(Fecha) %>%
+  mutate(PartidoID = 1:380) %>%
+  select(PartidoID, Resultado, Cuota_Victoria_Local, Cuota_Empate, Cuota_Victoria_Visitante)
+```
+
+```{r}
+simular_apuesta <- function(prediccion, resultado_real, cuota_local, cuota_empate, cuota_visitante) {
+  if (is.na(prediccion) || is.na(resultado_real)) {
+    return(NA)  
+  }
+  
+  if (prediccion == resultado_real) {
+    # Apuesta ganada
+    if (prediccion == "Victoria Local") {
+      return(cuota_local - 1)  # Ganancia neta
+    } else if (prediccion == "Empate") {
+      return(cuota_empate - 1)
+    } else if (prediccion == "Victoria Visitante") {
+      return(cuota_visitante - 1)
+    } else {
+      return(NA)  
+    }
+  } else {
+    # Apuesta perdida 
+    return(-1)  
+  }
+}
+```
+
+```{r}
+clasificacion_real <- data.frame(
+  Equipo = unique(c(datos23_24$EquipoLocal, datos23_24$EquipoVisitante)),
+  Puntos_Real = 0,
+  PJ = 0,
+  PG = 0,
+  PE = 0,
+  PP = 0,
+  GF = 0,
+  GC = 0,
+  stringsAsFactors = FALSE
+)
+
+for (i in 1:nrow(datos23_24)) {
+  equipo_local <- datos23_24$EquipoLocal[i]
+  equipo_visitante <- datos23_24$EquipoVisitante[i]
+  goles_local <- datos23_24$GolesLocal[i]
+  goles_visitante <- datos23_24$GolesVisitante[i]
+
+  idx_local <- match(equipo_local, clasificacion_real$Equipo)
+  idx_visitante <- match(equipo_visitante, clasificacion_real$Equipo)
+
+  clasificacion_real$PJ[idx_local] <- clasificacion_real$PJ[idx_local] + 1
+  clasificacion_real$PJ[idx_visitante] <- clasificacion_real$PJ[idx_visitante] + 1
+
+  clasificacion_real$GF[idx_local] <- clasificacion_real$GF[idx_local] + goles_local
+  clasificacion_real$GF[idx_visitante] <- clasificacion_real$GF[idx_visitante] + goles_visitante
+  clasificacion_real$GC[idx_local] <- clasificacion_real$GC[idx_local] + goles_visitante
+  clasificacion_real$GC[idx_visitante] <- clasificacion_real$GC[idx_visitante] + goles_local
+
+  if (goles_local > goles_visitante) {
+    clasificacion_real$Puntos_Real[idx_local] <- clasificacion_real$Puntos_Real[idx_local] + 3
+    clasificacion_real$PG[idx_local] <- clasificacion_real$PG[idx_local] + 1
+    clasificacion_real$PP[idx_visitante] <- clasificacion_real$PP[idx_visitante] + 1
+  } else if (goles_local < goles_visitante) {
+    clasificacion_real$Puntos_Real[idx_visitante] <- clasificacion_real$Puntos_Real[idx_visitante] + 3
+    clasificacion_real$PG[idx_visitante] <- clasificacion_real$PG[idx_visitante] + 1
+    clasificacion_real$PP[idx_local] <- clasificacion_real$PP[idx_local] + 1
+  } else {
+    clasificacion_real$Puntos_Real[idx_local] <- clasificacion_real$Puntos_Real[idx_local] + 1
+    clasificacion_real$Puntos_Real[idx_visitante] <- clasificacion_real$Puntos_Real[idx_visitante] + 1
+    clasificacion_real$PE[idx_local] <- clasificacion_real$PE[idx_local] + 1
+    clasificacion_real$PE[idx_visitante] <- clasificacion_real$PE[idx_visitante] + 1
+  }
+}
+
+clasificacion_real <- clasificacion_real[order(-clasificacion_real$Puntos_Real, -(clasificacion_real$GF - clasificacion_real$GC)), ]
+
+clasificacion_real[c(13, 14), ] <- clasificacion_real[c(14, 13), ]
+
+clasificacion_real$Posicion_Real <- 1:nrow(clasificacion_real)
+clasificacion_real<- clasificacion_real %>% select(last_col(), everything())
+```
+
+# Modelo 4: Random Forest de regresión para la predicción del número de goles
+
+Este modelo emplea bosques aleatorios de regresión para predecir el número de goles de cada equipo en un partido, utilizando covariables como el rendimiento en la temporada anterior, el valor de mercado de la plantilla o la puntuación ELO. Dado que las predicciones son valores continuos (habitualmente decimales), se interpretan como los parámetros $\lambda$ de distribuciones de Poisson independientes ($\text{Po}(\lambda)$), lo que permite tener una estimación del número de goles esperado de cada equipo en un encuentro.
+
+```{r}
+EloRatings <- read.csv("C:/Users/pablo/OneDrive/Escritorio/UNIVERSIDAD 24-25/TFG/R/EloRatings.csv", stringsAsFactors=TRUE)
+
+EloRatings$date <- as.Date(EloRatings$date)
+
+#Nos quedamos con los equipos españoles, la fecha de 2018 a 2024, y con los equipos que han estado en primera en las temporadas a estudiar:
+datosELO <- EloRatings %>%
+  filter(country == "ESP", date >= "2018-08-01", date <= "2024-06-01", club %in% c(levels(datos$EquipoLocal), "Las Palmas")) %>%
+  droplevels()
+
+```
+
+```{r}
+#library(dplyr)
+#library(readxl)
+#library(purrr)
+#library(lubridate)
+
+datos_RF <- datos %>%
+  mutate(PartidoID = row_number())  
+
+datos_RF <- datos_RF %>%
+  mutate(Goles = GolesLocal, Equipo = EquipoLocal, Rival = EquipoVisitante, Local = 1) %>%
+  select(PartidoID, Fecha, Equipo, Rival, Goles, Local) %>%
+  bind_rows(
+    datos_RF %>%
+      mutate(Goles = GolesVisitante, Equipo = EquipoVisitante, Rival = EquipoLocal, Local = 0) %>%
+      select(PartidoID, Fecha, Equipo, Rival, Goles, Local)
+  ) %>%
+  arrange(PartidoID, desc(Local))
+
+ruta_excel <- "C:/Users/pablo/OneDrive/Escritorio/UNIVERSIDAD 24-25/TFG/R/RF_Covariables.xlsx"
+hojas <- excel_sheets(ruta_excel)
+
+suppressWarnings({
+  covariables <- map(hojas, ~ read_excel(ruta_excel, sheet = .x) %>%
+                       mutate(Temporada = .x))  
+  
+  covariables <- map(covariables, ~ .x %>%
+                       mutate(across(c(Equipo, UCL, UEL, Entrenador), as.factor)))
+})
+
+covariables_combinadas <- bind_rows(covariables) %>%
+  mutate(Temporada = as.character(Temporada))
+
+datos_RF <- datos_RF %>%
+  mutate(Temporada = case_when(
+    Fecha >= "2018-08-01" & Fecha < "2019-07-01" ~ "18-19",
+    Fecha >= "2019-08-01" & Fecha < "2020-07-30" ~ "19-20",
+    Fecha >= "2020-08-01" & Fecha < "2021-07-01" ~ "20-21",
+    Fecha >= "2021-08-01" & Fecha < "2022-07-01" ~ "21-22",
+    Fecha >= "2022-08-01" & Fecha < "2023-07-01" ~ "22-23",
+    Fecha >= "2023-08-01" ~ "23-24"
+  ))
+
+datos_RF <- datos_RF %>%
+  left_join(covariables_combinadas, by = c("Equipo" = "Equipo", "Temporada" = "Temporada")) %>%
+  left_join(covariables_combinadas, by = c("Rival" = "Equipo", "Temporada" = "Temporada"), suffix = c("_E", "_R"))
+
+redondear_fecha_elo <- function(fecha) {
+  dia <- day(fecha)
+  if (dia < 15) {
+    return(as.Date(paste0(year(fecha), "-", month(fecha), "-01")))
+  } else {
+    return(as.Date(paste0(year(fecha), "-", month(fecha), "-15")))
+  }
+}
+
+datos_RF <- datos_RF %>%
+  mutate(Fecha_ELO = as.Date(ifelse(day(Fecha) < 15,
+                                    paste0(year(Fecha), "-", month(Fecha), "-01"),
+                                    paste0(year(Fecha), "-", month(Fecha), "-15"))))
+
+datos_RF <- datos_RF %>%
+  left_join(datosELO %>% select(date, club, elo) %>%
+              rename(Fecha_ELO = date, Equipo = club, Elo_Equipo = elo),
+            by = c("Fecha_ELO", "Equipo"))
+
+datos_RF <- datos_RF %>%
+  left_join(datosELO %>% select(date, club, elo) %>%
+              rename(Fecha_ELO = date, Rival = club, Elo_Rival = elo),
+            by = c("Fecha_ELO", "Rival"))
+
+variables_originales <- c("Pos", "PG", "PE", "PP", "GF", "GC", "DG", "Pts",
+                          "ValorMercado", "EdadMedia", "Gasto", "Ingresos", "Balance")
+
+for (var in variables_originales) {
+  datos_RF[[paste0(var, "_Dif")]] <- datos_RF[[paste0(var, "_E")]] - datos_RF[[paste0(var, "_R")]]
+}
+
+datos_RF <- datos_RF %>%
+  mutate(Elo_Dif = Elo_Equipo - Elo_Rival)
+
+columnas_dif <- grep("_Dif$", names(datos_RF), value = TRUE)
+datos_RF <- datos_RF[, c("Temporada", "Goles", columnas_dif)]
+```
+
+En primer lugar, se separan los datos en conjunto de entrenamiento (temporadas 2018/2019 a 2021/2022) y test (temporada 2022/2023), y se ajusta un random forest optimizando el parámetro $mtry$ mediante validación cruzada, obteniéndose la siguiente salida:
+
+```{r}
+train <- datos_RF %>% filter(Temporada %in% c("18-19", "19-20", "20-21", "21-22"))
+test <- datos_RF %>% filter(Temporada == "22-23")
+
+train <- train %>% select(Goles, Pos_Dif:Elo_Dif)
+test <- test %>% select(Goles, Pos_Dif:Elo_Dif)
+```
+
+```{r}
+#library(caret)
+
+#train_control <- trainControl(method = "cv", number = 5)  
+
+#model_cv <- train(Goles ~ ., data = train, method = "rf",
+#                  trControl = train_control,
+#                  tuneGrid = expand.grid(mtry = 2:6))  
+
+#print(model_cv)
+```
+
+```{r}
+#modelo_rf <- randomForest(Goles ~ ., data = train, ntree = 1000, mtry = 4, importance = TRUE)
+
+#importance(modelo_rf)
+#print(modelo_rf)
+```
+
+```{r}
+train <- train %>% select(Goles, Pts_Dif, Pos_Dif, GF_Dif, GC_Dif, ValorMercado_Dif, Gasto_Dif, EdadMedia_Dif, Elo_Dif)
+test <- test %>% select(Goles, Pts_Dif, Pos_Dif, GF_Dif, GC_Dif, ValorMercado_Dif, Gasto_Dif, EdadMedia_Dif, Elo_Dif)
+```
+
+```{r cvMod4, results='asis'}
+#library(caret)
+
+train_control <- trainControl(method = "cv", number = 5)  
+
+model_cv <- train(Goles ~ ., data = train, method = "rf",
+                  trControl = train_control,
+                  tuneGrid = expand.grid(mtry = 2:6))  
+
+resultados_rf <- model_cv$results %>%
+  arrange(RMSE)
+
+kable(resultados_rf,
+      format = "latex",
+      caption = "Resultados validación cruzada (Modelo 5)",
+      booktabs = TRUE,
+      row.names = FALSE,
+      digits = 3,
+      align = "c") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"))
+
+#print(model_cv)
+#cat(paste0("\\textbf{Mejor valor de mtry:} ", model_cv$bestTune$mtry, "\\\\\n"))
+#cat("Mejor valor de mtry:", model_cv$bestTune$mtry, "\n")
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Se observa que el valor óptimo del parámetro $mtry$ es 2, pues es el que minimiza el error cuadrático medio (RMSE). Se ajusta entonces el modelo de random forest utilizando dicho valor y un total de 1000 árboles. Además, la importancia de las covariables empleadas en el modelo se muestra en el siguiente gráfico:
+
+```{r}
+modelo_rf <- randomForest(Goles ~ ., data = train, ntree = 1000, mtry = 2, importance = TRUE)
+#print(modelo_rf)
+```
+
+```{r grafImportanciaMod4, fig.cap="Importancia de las covariables (Modelo 4)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+varImpPlot(modelo_rf)
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Se evalúa ahora el rendimiento del modelo en el conjunto test (temporada 2022/2023), mediante el Error Cuadrático Medio (RMSE) y el Error Absoluto Medio (MAE) cometidos en la predicción de los goles de cada partido:
+
+```{r}
+test$Goles_Predichos <- predict(modelo_rf, test)
+#cor(test$Goles, test$Goles_Predichos)  
+```
+
+```{r results='asis'}
+RMSE <- sqrt(mean((test$Goles - test$Goles_Predichos)^2))
+cat(paste0("\\textbf{RMSE:} ", round(RMSE, 3), "\n"))
+```
+
+```{r results='asis'}
+MAE <- mean(abs(test$Goles - test$Goles_Predichos))
+cat(paste0("\\textbf{MAE:} ", round(MAE, 3), "\n"))
+```
+
+```{r}
+#library(dplyr)
+#library(readxl)
+#library(lubridate)
+
+datos23_24_RF <- datos23_24 %>%
+  mutate(PartidoID = row_number())
+
+datos23_24_RF <- datos23_24_RF %>%
+  mutate(Goles = GolesLocal, Equipo = EquipoLocal, Rival = EquipoVisitante, Local = 1) %>%
+  select(PartidoID, Fecha, Equipo, Rival, Goles, Local) %>%
+  bind_rows(
+    datos23_24_RF %>%
+      mutate(Goles = GolesVisitante, Equipo = EquipoVisitante, Rival = EquipoLocal, Local = 0) %>%
+      select(PartidoID, Fecha, Equipo, Rival, Goles, Local)
+  ) %>%
+  arrange(PartidoID, desc(Local))
+
+ruta_excel <- "C:/Users/pablo/OneDrive/Escritorio/UNIVERSIDAD 24-25/TFG/R/RF_Covariables.xlsx"
+
+covariables_23_24 <- read_excel(ruta_excel, sheet = "23-24") %>%
+  mutate(across(c(Equipo, UCL, UEL, Entrenador), as.factor)) %>%
+  mutate(Temporada = "23-24")
+
+datos23_24_RF <- datos23_24_RF %>%
+  mutate(Temporada = "23-24")
+
+datos23_24_RF <- datos23_24_RF %>%
+  left_join(covariables_23_24, by = c("Equipo", "Temporada")) %>%
+  left_join(covariables_23_24, by = c("Rival" = "Equipo", "Temporada"), suffix = c("_E", "_R"))
+
+datos23_24_RF <- datos23_24_RF %>%
+  mutate(Fecha_ELO = as.Date(ifelse(day(Fecha) < 15,
+                                    paste0(year(Fecha), "-", month(Fecha), "-01"),
+                                    paste0(year(Fecha), "-", month(Fecha), "-15"))))
+
+datos23_24_RF <- datos23_24_RF %>%
+  left_join(datosELO %>% select(date, club, elo) %>%
+              rename(Fecha_ELO = date, Equipo = club, Elo_Equipo = elo),
+            by = c("Fecha_ELO", "Equipo"))
+
+datos23_24_RF <- datos23_24_RF %>%
+  left_join(datosELO %>% select(date, club, elo) %>%
+              rename(Fecha_ELO = date, Rival = club, Elo_Rival = elo),
+            by = c("Fecha_ELO", "Rival"))
+
+variables_originales <- c("Pos", "PG", "PE", "PP", "GF", "GC", "DG", "Pts",
+                          "ValorMercado", "EdadMedia", "Gasto", "Ingresos", "Balance")
+
+for (var in variables_originales) {
+  datos23_24_RF[[paste0(var, "_Dif")]] <- datos23_24_RF[[paste0(var, "_E")]] - datos23_24_RF[[paste0(var, "_R")]]
+}
+
+datos23_24_RF <- datos23_24_RF %>%
+  mutate(Elo_Dif = Elo_Equipo - Elo_Rival)
+
+columnas_dif <- grep("_Dif$", names(datos23_24_RF), value = TRUE)
+
+datos23_24_RF <- datos23_24_RF %>%
+  select(PartidoID, Equipo, Rival, Local, Temporada, Goles, all_of(columnas_dif)) %>%
+  na.omit()  
+
+datos23_24_RF <- datos23_24_RF %>% select(PartidoID, Equipo, Rival, Local, Goles, Pts_Dif, Pos_Dif, GF_Dif, GC_Dif, ValorMercado_Dif, Gasto_Dif, EdadMedia_Dif, Elo_Dif)
+```
+
+Aplicamos ahora el modelo ajustado a los partidos de la temporada 2023/2024. Se utilizan los valores continuos predichos por el Random Forest como medias de distribuciones de Poisson independientes, a partir de las cuales se generan valores enteros para los goles de cada uno de los dos equipos en cada partido.
+
+```{r}
+predicciones_rf <- predict(modelo_rf, datos23_24_RF)
+datos23_24_RF$GolesPredichos <- predicciones_rf
+# head(datos23_24_RF)
+```
+
+```{r}
+set.seed(10)  
+# Generamos goles predichos como enteros usando la distribución Poisson
+datos23_24_RF$GolesPredichosEnteros <- rpois(nrow(datos23_24_RF), datos23_24_RF$GolesPredichos)
+# head(datos23_24_RF)
+```
+
+Como ejemplo, en la siguiente tabla se muestran las primeras predicciones generadas:
+
+```{r results='asis'}
+head(datos23_24_RF %>%
+  select(PartidoID, Equipo, Rival, Goles, GolesPredichos, GolesPredichosEnteros)) %>%
+  kable(format = "latex", caption = "Primeras predicciones generadas (Modelo 4)", 
+        booktabs = TRUE, row.names = FALSE, align = "c", digits = 2) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+```{r}
+#library(dplyr)
+#library(kableExtra)
+
+temp23_24_RF <- datos23_24_RF %>%
+  mutate(prediccion_local = ifelse(Local == 1, GolesPredichos, NA),
+         prediccion_visitante = ifelse(Local == 0, GolesPredichos, NA))
+
+datos_final <- temp23_24_RF %>%
+  group_by(PartidoID) %>%
+  summarise(  
+    EquipoLocal = first(Equipo),  
+    EquipoVisitante = first(Rival),  
+    GolesLocal = sum(Goles[Local == 1], na.rm = TRUE),  
+    GolesVisitante = sum(Goles[Local == 0], na.rm = TRUE),  
+    GolesLocalRF = sum(prediccion_local, na.rm = TRUE),  
+    GolesVisitanteRF = sum(prediccion_visitante, na.rm = TRUE)  
+  ) %>%
+  ungroup()  
+
+#head(datos_final) %>%
+#  kable(format = "html", caption = "Primeras predicciones") %>%
+#  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+Siguiendo el mismo procedimiento aplicado en los modelos anteriores, realizamos 1000 simulaciones de la temporada 2023/2024 para hacer una clasificación basada en la cantidad media de puntos conseguidos por cada equipo.
+
+```{r ClasificacionMod4, results='asis'}
+set.seed(10)
+n_simulaciones <- 1000
+
+equipos <- unique(c(datos23_24$EquipoLocal, datos23_24$EquipoVisitante))
+n_equipos <- length(equipos)
+
+resultados_sim <- matrix(0, nrow = n_equipos, ncol = n_simulaciones)
+puntos_sim <- matrix(0, nrow = n_equipos, ncol = n_simulaciones)
+
+for (sim in 1:n_simulaciones) {
+  if (sim %% 100 == 0) {
+    #cat("Simulación", sim, "de", n_simulaciones, "\n")
+  }
+  
+  clasificacion <- data.frame(
+    Equipo = equipos, Puntos = 0, PJ = 0, PG = 0, PE = 0, PP = 0, GF = 0, GC = 0, stringsAsFactors = FALSE
+  )
+
+  goles_locales <- rpois(nrow(datos23_24), datos_final$GolesLocalRF)
+  goles_visitantes <- rpois(nrow(datos23_24), datos_final$GolesVisitanteRF)
+
+  for (i in 1:nrow(datos23_24)) {
+    equipo_local <- datos23_24$EquipoLocal[i]
+    equipo_visitante <- datos23_24$EquipoVisitante[i]
+
+    goles_local <- goles_locales[i]
+    goles_visitante <- goles_visitantes[i]
+
+    idx_local <- match(equipo_local, equipos)
+    idx_visitante <- match(equipo_visitante, equipos)
+
+    clasificacion$PJ[idx_local] <- clasificacion$PJ[idx_local] + 1
+    clasificacion$PJ[idx_visitante] <- clasificacion$PJ[idx_visitante] + 1
+    clasificacion$GF[idx_local] <- clasificacion$GF[idx_local] + goles_local
+    clasificacion$GF[idx_visitante] <- clasificacion$GF[idx_visitante] + goles_visitante
+    clasificacion$GC[idx_local] <- clasificacion$GC[idx_local] + goles_visitante
+    clasificacion$GC[idx_visitante] <- clasificacion$GC[idx_visitante] + goles_local
+
+    if (goles_local > goles_visitante) {  
+      clasificacion$Puntos[idx_local] <- clasificacion$Puntos[idx_local] + 3
+      clasificacion$PG[idx_local] <- clasificacion$PG[idx_local] + 1
+      clasificacion$PP[idx_visitante] <- clasificacion$PP[idx_visitante] + 1
+    } else if (goles_local < goles_visitante) {  
+      clasificacion$Puntos[idx_visitante] <- clasificacion$Puntos[idx_visitante] + 3
+      clasificacion$PG[idx_visitante] <- clasificacion$PG[idx_visitante] + 1
+      clasificacion$PP[idx_local] <- clasificacion$PP[idx_local] + 1
+    } else {  
+      clasificacion$Puntos[idx_local] <- clasificacion$Puntos[idx_local] + 1
+      clasificacion$Puntos[idx_visitante] <- clasificacion$Puntos[idx_visitante] + 1
+      clasificacion$PE[idx_local] <- clasificacion$PE[idx_local] + 1
+      clasificacion$PE[idx_visitante] <- clasificacion$PE[idx_visitante] + 1
+    }
+  }
+
+  clasificacion <- clasificacion[order(-clasificacion$Puntos, -(clasificacion$GF - clasificacion$GC)), ]
+
+  resultados_sim[, sim] <- order(match(clasificacion$Equipo, equipos))
+  puntos_sim[, sim] <- clasificacion$Puntos[match(equipos, clasificacion$Equipo)]
+}
+
+predRF <- data.frame(
+  Equipo = equipos,
+  Media_Puntos = rowMeans(puntos_sim),  
+  Prob_Campeon = rowMeans(resultados_sim == 1) * 100,  
+  Prob_UCL = rowMeans(resultados_sim <= 4) * 100,  
+  Prob_UEL = rowMeans(resultados_sim >= 5 & resultados_sim <= 6) * 100,  
+  Prob_UECL = rowMeans(resultados_sim == 7) * 100,  
+  Prob_Mitad_Tabla = rowMeans(resultados_sim >= 8 & resultados_sim <= 17) * 100,  
+  Prob_Descenso = rowMeans(resultados_sim >= 18) * 100  
+)
+
+predRF <- predRF[order(-predRF$Media_Puntos), ]
+predRF$Posicion <- 1:nrow(predRF)
+
+predRF <- predRF[, c("Posicion", "Equipo", "Media_Puntos", "Prob_Campeon", "Prob_UCL", "Prob_UEL", "Prob_UECL", "Prob_Mitad_Tabla", "Prob_Descenso")]
+
+kable(predRF, format = "latex", 
+      caption = "Probabilidades de clasificación (Modelo 4)", 
+      booktabs = TRUE, row.names = FALSE, escape = TRUE, align = "c") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+## Comparación de Posiciones
+
+Siguiendo con el análisis realizado en los modelos previos, se realiza un análisis del error cometido en la predicción de las posiciones finales.
+
+```{r}
+comparacion <- merge(predRF, clasificacion_real[, c("Equipo", "Posicion_Real")], by = "Equipo")
+
+error_posicion <- abs(comparacion$Posicion - comparacion$Posicion_Real)
+error_medio_posicion <- mean(error_posicion)
+
+# cat("Error medio de posiciones:", error_medio_posicion, "\n")
+```
+
+```{r tablaComparacionPosicionesMod4, results='asis'}
+#library(dplyr)
+
+# Creamos una tabla de comparación entre la predicción y la clasificación real
+comparacion_posiciones <- predRF %>%
+  select(Equipo, Posicion) %>% 
+  rename(Posicion_Predicha = Posicion) %>%
+  left_join(clasificacion_real %>% select(Equipo, Posicion_Real), by = "Equipo") %>%
+  mutate(Error_Posicion = abs(Posicion_Predicha - Posicion_Real)) %>%
+  arrange(Posicion_Predicha)  
+
+comparacion_posiciones %>%
+  kable(format = "latex", caption = "Comparación de Posiciones: Predichas vs Reales", booktabs = TRUE, row.names = FALSE, align = "c") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down", "condensed"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+```{r results='asis'}
+cat("El error absoluto medio entre las posiciones predichas y reales es:", round(error_medio_posicion, 2), "\n")
+```
+
+Por tanto, en términos de error absoluto medio en la predicción de las posiciones finales de los equipos, este modelo es el que peor capacidad predictiva tiene.
+
+```{r graficoComparacionPosicionesMod4, fig.cap="Comparación de posiciones Predichas vs Reales (Modelo 4)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+#library(ggplot2)
+
+ggplot(comparacion, aes(x = Posicion_Real, y = Posicion, label = Equipo)) +
+  geom_point(color = "blue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  geom_text(vjust = -0.5, size = 3) +
+  labs(title = "Comparación de Posiciones Simuladas vs Reales",
+       x = "Posición Real",
+       y = "Posición Simulada") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Se visualizan fallos relevantes en equipos como Alavés, Valencia, Sevilla y Girona, con errores de predicción que superan 5 posiciones.
+
+## Comparación de Puntos
+
+Realizamos el mismo estudio con la predicción de los puntos, derivándose la siguiente tabla:
+
+```{r}
+#library(dplyr)
+#library(ggplot2)
+
+comparacion_puntos <- predRF %>%
+  select(Equipo, Media_Puntos) %>%
+  rename(Puntos_Predichos = Media_Puntos) %>%
+  left_join(clasificacion_real %>% select(Equipo, Puntos_Real), by = "Equipo") %>%
+  mutate(Error_Puntos = abs(Puntos_Predichos - Puntos_Real)) %>%
+  arrange(desc(Puntos_Predichos))  
+
+error_medio_puntos <- mean(comparacion_puntos$Error_Puntos)
+#cat("Error medio de puntos:", error_medio_puntos, "\n")
+```
+
+```{r tablaComparacionPuntosMod4, results='asis'}
+comparacion_puntos %>%
+  kable(format = "latex", caption = "Comparación de Puntos: Predichos vs Reales", booktabs = TRUE, row.names = FALSE, align = "c") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down", "condensed"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+```{r results='asis'}
+cat("El error absoluto medio entre los puntos predichos y reales es:", round(error_medio_puntos, 2), "\n")
+```
+
+Del mismo modo que con la predicción de las posiciones, la capacidad predictiva de los puntos obtenidos por cada equipo de este modelo es la peor en comparación con los anteriores.
+
+```{r graficoComparacionPuntosMod4, fig.cap="Comparación de puntos Predichos vs Reales (Modelo 4)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+ggplot(comparacion_puntos, aes(x = Puntos_Real, y = Puntos_Predichos, label = Equipo)) +
+  geom_point(color = "blue", size = 3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  geom_text(vjust = -0.5, size = 3) +
+  labs(title = "Comparación de Puntos Predichos vs Reales",
+       x = "Puntos Reales",
+       y = "Puntos Predichos") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Gráficamente se observan errores notables en equipos como Real Madrid, Girona, Athletic de Bilbao, Almería y Granada.
+
+# Modelo 5: Random Forest de clasificación para la predicción del resultado
+
+En este apartado se aplica un modelo basado en Random Forest de clasificación con el fin de predecir el resultado de los partidos (victoria local, empate o victoria visitante). A diferencia de los modelos anteriores centrados en el número de goles, aquí la variable respuesta es categórica. Se utilizan los mismos datos y covariables del modelo de regresión. El modelo se entrenará y ajustará mediante validación cruzada, y su objetivo principal es desarrollar una estrategia de apuestas rentable basada en la predicción del resultado final.
+
+```{r}
+#library(dplyr)
+EloRatings <- read.csv("C:/Users/pablo/OneDrive/Escritorio/UNIVERSIDAD 24-25/TFG/R/EloRatings.csv", stringsAsFactors=TRUE)
+
+EloRatings$date <- as.Date(EloRatings$date)
+
+#Nos quedamos con los equipos españoles, la fecha de 2018 a 2024, y con los equipos que han estado en primera en las temporadas a estudiar:
+datosELO <- EloRatings %>%
+  filter(country == "ESP", date >= "2018-08-01", date <= "2024-06-01", club %in% c(levels(datos$EquipoLocal), "Las Palmas")) %>%
+  droplevels()
+
+datosELO <- datosELO %>%
+  rename(Fecha_ELO = date, Club = club, Elo = elo)
+```
+
+```{r}
+#library(dplyr)
+#library(randomForest)
+#library(readxl)
+#library(purrr)
+
+datos_RF <- datos %>%
+  mutate(PartidoID = row_number()) %>%
+  mutate(Equipo = EquipoLocal, Rival = EquipoVisitante) %>%
+  select(PartidoID, Fecha, Equipo, Rival, Resultado)
+
+ruta_excel <- "C:/Users/pablo/OneDrive/Escritorio/UNIVERSIDAD 24-25/TFG/R/RF_Covariables.xlsx"
+hojas <- excel_sheets(ruta_excel)
+
+suppressWarnings({
+  covariables <- map(hojas, ~ read_excel(ruta_excel, sheet = .x) %>%
+                       mutate(Temporada = .x)) %>%
+    map(~ .x %>%
+          mutate(across(c(Equipo, UCL, UEL), as.factor)))  # 
+})
+
+covariables_combinadas <- bind_rows(covariables) %>%
+  mutate(Temporada = as.character(Temporada))
+
+datos_RF <- datos_RF %>%
+  mutate(Temporada = case_when(
+    Fecha >= "2018-08-01" & Fecha < "2019-07-01" ~ "18-19",
+    Fecha >= "2019-08-01" & Fecha < "2020-07-30" ~ "19-20",
+    Fecha >= "2020-08-01" & Fecha < "2021-07-01" ~ "20-21",
+    Fecha >= "2021-08-01" & Fecha < "2022-07-01" ~ "21-22",
+    Fecha >= "2022-08-01" & Fecha < "2023-07-01" ~ "22-23",
+    Fecha >= "2023-08-01" ~ "23-24"
+  ))
+
+datos_RF <- datos_RF %>%
+  left_join(covariables_combinadas, by = c("Equipo" = "Equipo", "Temporada")) %>%
+  left_join(covariables_combinadas, by = c("Rival" = "Equipo", "Temporada"), suffix = c("_E", "_R"))
+
+variables_originales <- c("Pts", "Pos", "GF", "GC", "ValorMercado", "EdadMedia", "Gasto")
+
+for (var in variables_originales) {
+  datos_RF[[paste0(var, "_Dif")]] <- datos_RF[[paste0(var, "_E")]] - datos_RF[[paste0(var, "_R")]]
+}
+
+datos_RF <- datos_RF %>%
+  mutate(Fecha_ELO = as.Date(ifelse(lubridate::day(Fecha) < 15,
+                                    paste0(lubridate::year(Fecha), "-", lubridate::month(Fecha), "-01"),
+                                    paste0(lubridate::year(Fecha), "-", lubridate::month(Fecha), "-15"))))
+
+datos_RF <- datos_RF %>%
+  left_join(datosELO, by = c("Fecha_ELO" = "Fecha_ELO", "Equipo" = "Club")) %>%
+  rename(Elo_Equipo = Elo)
+datos_RF <- datos_RF %>%
+  left_join(datosELO, by = c("Fecha_ELO" = "Fecha_ELO", "Rival" = "Club")) %>%
+  rename(Elo_Rival = Elo)
+datos_RF <- datos_RF %>%
+  mutate(Elo_Dif = Elo_Equipo - Elo_Rival)
+
+columnas_dif <- c("Pts_Dif", "Pos_Dif", "GF_Dif", "GC_Dif", "ValorMercado_Dif", "EdadMedia_Dif", "Gasto_Dif", "Elo_Dif")
+
+datos_RF <- datos_RF %>%
+  select(PartidoID, Temporada, Fecha, Equipo, Rival, Resultado, all_of(columnas_dif)) %>%
+  na.omit()
+
+datos_RF_clas <- datos_RF %>% select(Resultado:Elo_Dif)
+```
+
+```{r}
+#library(dplyr)
+#library(readxl)
+#library(purrr)
+#library(lubridate)
+
+datos_RF_23_24 <- datos23_24 %>%
+  mutate(PartidoID = row_number(),
+         Equipo = EquipoLocal,
+         Rival = EquipoVisitante) %>%
+  select(PartidoID, Fecha, Equipo, Rival, Resultado)
+
+datos_RF_23_24 <- datos_RF_23_24 %>%
+  mutate(Temporada = "23-24")
+
+ruta_excel <- "C:/Users/pablo/OneDrive/Escritorio/UNIVERSIDAD 24-25/TFG/R/RF_Covariables.xlsx"
+hojas <- excel_sheets(ruta_excel)
+
+suppressWarnings({
+  covariables <- map(hojas, ~ read_excel(ruta_excel, sheet = .x) %>%
+                       mutate(Temporada = .x)) %>%
+    map(~ .x %>%
+          mutate(across(c(Equipo, UCL, UEL), as.factor)))
+})
+
+covariables_combinadas <- bind_rows(covariables) %>%
+  mutate(Temporada = as.character(Temporada))
+
+datos_RF_23_24 <- datos_RF_23_24 %>%
+  left_join(covariables_combinadas, by = c("Equipo" = "Equipo", "Temporada")) %>%
+  left_join(covariables_combinadas, by = c("Rival" = "Equipo", "Temporada"), suffix = c("_E", "_R"))
+
+variables_originales <- c("Pts", "Pos", "GF", "GC", "ValorMercado", "EdadMedia", "Gasto")
+
+for (var in variables_originales) {
+  datos_RF_23_24[[paste0(var, "_Dif")]] <- datos_RF_23_24[[paste0(var, "_E")]] - datos_RF_23_24[[paste0(var, "_R")]]
+}
+
+datos_RF_23_24 <- datos_RF_23_24 %>%
+  mutate(Fecha_ELO = as.Date(ifelse(day(Fecha) < 15,
+                                    paste0(year(Fecha), "-", month(Fecha), "-01"),
+                                    paste0(year(Fecha), "-", month(Fecha), "-15"))))
+
+datos_RF_23_24 <- datos_RF_23_24 %>%
+  left_join(datosELO, by = c("Fecha_ELO" = "Fecha_ELO", "Equipo" = "Club")) %>%
+  rename(Elo_Equipo = Elo) %>%
+  left_join(datosELO, by = c("Fecha_ELO" = "Fecha_ELO", "Rival" = "Club")) %>%
+  rename(Elo_Rival = Elo)
+
+datos_RF_23_24 <- datos_RF_23_24 %>%
+  mutate(Elo_Dif = Elo_Equipo - Elo_Rival)
+
+columnas_dif <- c("Pts_Dif", "Pos_Dif", "GF_Dif", "GC_Dif",
+                  "ValorMercado_Dif", "EdadMedia_Dif", "Gasto_Dif", "Elo_Dif")
+
+datos_RF_23_24 <- datos_RF_23_24 %>%
+  select(PartidoID, Temporada, Fecha, Equipo, Rival, Resultado, all_of(columnas_dif)) %>%
+  na.omit()
+
+datos_RF_23_24_clas <- datos_RF_23_24 %>% select(Resultado, all_of(columnas_dif))
+```
+
+Al igual que en el modelo justamente anterior, se divide el conjunto de datos en entrenamiento (temporadas 2018/2019 a 2021/2022) y test (temporada 2022/2023). Antes de proceder con la construcción del modelo, se analiza la distribución de las observaciones entre las 3 clases del conjunto de entrenamiento para detectar si los datos están desbalanceados. La tabla resultante es la siguiente:
+
+```{r tablaTrainMod5, results='asis'}
+train <- datos_RF %>% filter(Temporada %in% c("18-19", "19-20", "20-21", "21-22"))
+test <- datos_RF %>% filter(Temporada == "22-23")
+
+train <- train %>% select(Resultado, Pts_Dif:Elo_Dif)
+test <- test %>% select(Resultado, Pts_Dif:Elo_Dif)
+
+tablaTrain <- table(train$Resultado)
+tablaTrain <- as.data.frame(tablaTrain)
+colnames(tablaTrain) <- c("Clase", "Frecuencia")
+kable(tablaTrain, format = "latex", caption = "Frecuencia de clases (conjunto train)", booktabs = TRUE, row.names = FALSE, escape = FALSE, align = "c") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Como puede observarse, las victorias locales son considerablemente más frecuentes que los empates o las victorias visitantes, lo cual podría inducir un sesgo en el modelo hacia la clase "Victoria Local". Para evitar esto, se realizará un proceso de balanceo (upsampling) sobre el conjunto de entrenamiento, asegurando una representación equitativa de cada clase. El resultado de la nueva distribución es el siguiente:
+
+```{r tablaTrainBalMod5, results='asis'}
+#library(caret)
+set.seed(10)
+train_balanceado <- upSample(x = train[, -1], y = train$Resultado, yname = "Resultado")
+
+tablaTrainBal <- table(train_balanceado$Resultado)
+tablaTrainBal <- as.data.frame(tablaTrainBal)
+colnames(tablaTrainBal) <- c("Clase", "Frecuencia")
+kable(tablaTrainBal, format = "latex", caption = "Frecuencia de clases tras balanceo", booktabs = TRUE, row.names = FALSE, escape = FALSE, align = "c") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Para validar el modelo y seleccionar el valor óptimo del hiperparámetro mtry, se empleará validación cruzada con 5 pliegues y 5 repeticiones. Se evaluará el rendimiento del modelo mediante métricas como la precisión global y la precisión específica para cada clase (Victoria Local, Empate y Victoria Visitante).
+
+Dado que el objetivo final es desarrollar una estrategia de apuestas lo más rentable posible, elegiremos el valor de mtry que genere tanto mayor precisión global como mayor precisión en las clases "Empate" y "Victoria Visitante", puesto que ambas clases suelen estar asociadas a cuotas más altas en las casas de apuestas. Se genera la siguiente salida en R:
+
+```{r cvMod5, results='asis'}
+#library(randomForest)
+
+summary_cv <- function(data, lev = NULL, model = NULL) {
+  cm <- confusionMatrix(data$pred, data$obs)
+  
+  accuracy <- cm$overall["Accuracy"]
+  
+  s_local <- cm$byClass["Class: Victoria Local", "Sensitivity"]
+  s_empate <- cm$byClass["Class: Empate", "Sensitivity"]
+  s_visitante <- cm$byClass["Class: Victoria Visitante", "Sensitivity"]
+
+  media_emp_vis <- mean(c(s_empate, s_visitante), na.rm = TRUE)
+
+  return(c(Accuracy = accuracy,
+           Precision_Local = s_local,
+           Precision_Empate = s_empate,
+           Precision_Visitante = s_visitante,
+           PrecMedia_Emp_Visit = media_emp_vis))
+}
+
+control <- trainControl(method = "repeatedcv",
+                        number = 5,
+                        repeats = 5,
+                        summaryFunction = summary_cv,
+                        classProbs = FALSE
+                        )
+
+set.seed(100)
+modelo_caret <- train(Resultado ~ .,
+                      data = train_balanceado,
+                      method = "rf",
+                      trControl = control,
+                      metric = "Accuracy",
+                      tuneGrid = expand.grid(mtry = 2:6),
+                      ntree = 200)
+
+#print(modelo_caret)
+
+resultados_cv_mod5 <- modelo_caret$results %>%
+  rename(Accuracy = Accuracy.Accuracy) %>%
+  arrange(desc(Accuracy)) %>%
+  select(mtry, Accuracy, Precision_Local, Precision_Empate, Precision_Visitante, PrecMedia_Emp_Visit)
+ 
+resultados_cv_mod5 %>%
+  kable(format = "latex", caption = "Mejores modelos validación cruzada (Modelo 5)", booktabs = TRUE, row.names = FALSE, align = "c", digits = 4) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down", "condensed"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Se detecta que el mejor resultado se obtiene con un valor de $mtry$ = 3, alcanzando una precisión global de 66,82%. Además, es el valor que logra mejor sensibilidad en las clases "Empate" y "Victoria Visitante", lo cual es especialmente relevante teniendo en cuenta el objetivo teniendo en cuenta el objetivo del modelo: obtener la mayor rentabilidad posible mediante la estrategia de apuestas ya explicada. Es por ello que se usará este valor del parámetro $mtry$ para desarrollar el modelo y realizar las predicciones.
+
+Para evaluar la capacidad de generalización del modelo, se utiliza el conjunto test correspondiente a la temporada 2022/2023. Se entrenan 50 modelos independientes de Random Forest con los hiperparámetros seleccionados anteriormente (en particular, mtry = 3 y ntree = 500). Para cada modelo se realizan predicciones sobre el conjunto de test y se calculan tanto la precisión global como la precisión por clase. El objetivo es obtener una estimación robusta del rendimiento medio del modelo en datos no vistos.
+
+```{r evalTestMod5, results='asis'}
+#library(randomForest)
+#library(caret)
+
+set.seed(10)
+n_sim <- 50
+
+precisiones <- numeric(n_sim)
+sensitividades <- matrix(NA, nrow = n_sim, ncol = 3)  # 3 clases
+
+for (i in 1:n_sim) {
+  modelo_rf <- randomForest(Resultado ~ ., data = train_balanceado, ntree = 500, mtry = 3)
+  pred <- predict(modelo_rf, newdata = test)
+  cm <- confusionMatrix(pred, test$Resultado)
+  
+  precisiones[i] <- cm$overall["Accuracy"]
+  sensitividades[i, ] <- cm$byClass[,"Sensitivity"]
+}
+
+prec_clase <- round(colMeans(sensitividades), 3)
+names(prec_clase) <- c("Empate", "Victoria Local", "Victoria Visitante")
+prec_global <- round(mean(precisiones), 3)
+tabla_prec <- data.frame(
+  Clase = c(names(prec_clase), "Global"),
+  `Precisión Media` = c(prec_clase, prec_global)
+)
+
+kable(tabla_prec,
+      format = "latex",
+      caption = "Precisión media conjunto test (Modelo 5)",
+      booktabs = TRUE,
+      row.names = FALSE,
+      align = "c") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"))
+
+
+#cat("\\textbf{Precisión media global:} ", round(mean(precisiones), 3), " \\\\ \n")
+#cat("\\textbf{Precisión media por clase:} \\\\ \n")
+#prec_clase <- round(colMeans(sensitividades), 3)
+#names(prec_clase) <- c("Empate", "Victoria Local", "Victoria Visitante")
+#print(prec_clase)
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Se tiene una precisión global media del 52% sobre el conjunto test, es decir, predice correctamente el resultado de más de la mitad de los partidos. Puede considerarse que el modelo funciona de forma adecuada, pues predecir más de la mitad de los resultados de los partidos de toda una temporada, a priori, parece una cuestión complicada, teniendo en cuenta la alta aleatoriedad e incertidumbre inherente al fútbol. Aunque la precisión no es perfecta, el modelo demuestra una capacidad predictiva destacable en un problema tan complejo.
+
+Por otro lado, se observa una mayor precisión en la clase "Victoria Local" (67,8%), mientras que las clases "Empate" (23,6%) y "Victoria Visitante" (48,7%) presentan valores más bajos, lo que refleja la gran dificultad de predecir, en particular, los empates.
+
+## Estrategia de apuestas
+
+Tras evaluar el rendimiento del modelo de clasificación con los datos test, se plantea ahora un análisis para determinar si las predicciones pueden aprovecharse para generar beneficios económicos a través de apuestas deportivas en la temporada 2023/2024.
+
+Para ello, se simula una estrategia en la que se apuesta 1 unidad monetaria al resultado predicho por el modelo para cada partido de la temporada 2023/2024, utilizando las cuotas reales ofrecidas por la casa de apuestas BET365. Dado que el modelo presenta cierta aleatoriedad en cada ejecución, se repite el proceso 100 veces, entrenando modelos distintos bajo las mismas condiciones y registrando la ganancia neta obtenida en cada caso. Esto permite calcular tanto la ganancia neta media como el retorno medio de la inversión (ROI), proporcionando una visión más robusta sobre la rentabilidad potencial sobre la nueva temporada.
+
+Se comienza presentando la precisión sobre la temporada 2023/2024:
+
+```{r precisionMod5, results='asis'}
+#library(randomForest)
+#library(dplyr)
+
+set.seed(10)
+n_iter <- 100
+
+ganancias_rf <- numeric(n_iter)
+rois_rf <- numeric(n_iter)
+datos_apuesta_rf_lista <- list()
+
+for (i in 1:n_iter) {
+  modelo_rf <- randomForest(Resultado ~ ., data = train_balanceado,
+                            ntree = 500, mtry = 3, importance = FALSE)
+
+  datos_RF_23_24_clas$Resultado_Predicho <- predict(modelo_rf, datos_RF_23_24_clas)
+
+  datos_apuesta_rf <- bind_cols(
+    Resultado_Predicho = datos_RF_23_24_clas$Resultado_Predicho,
+    cuotas_23_24  
+  )
+  
+  datos_apuesta_rf <- datos_apuesta_rf %>%
+    select(Resultado, Resultado_Predicho, Cuota_Victoria_Local, Cuota_Empate, Cuota_Victoria_Visitante)
+
+  datos_apuesta_rf$Ganancia <- mapply(simular_apuesta,
+                                      datos_apuesta_rf$Resultado_Predicho,
+                                      datos_apuesta_rf$Resultado,
+                                      datos_apuesta_rf$Cuota_Victoria_Local,
+                                      datos_apuesta_rf$Cuota_Empate,
+                                      datos_apuesta_rf$Cuota_Victoria_Visitante)
+
+  ganancia_total_rf <- sum(datos_apuesta_rf$Ganancia, na.rm = TRUE)
+  roi_rf <- ganancia_total_rf / nrow(datos_apuesta_rf)
+
+  datos_apuesta_rf_lista[[i]] <- data.frame(
+    Modelo = i,
+    Resultado = datos_apuesta_rf$Resultado,
+    Resultado_Predicho = datos_apuesta_rf$Resultado_Predicho,
+    Cuota_Victoria_Local = datos_apuesta_rf$Cuota_Victoria_Local,
+    Cuota_Empate = datos_apuesta_rf$Cuota_Empate,
+    Cuota_Victoria_Visitante = datos_apuesta_rf$Cuota_Victoria_Visitante,
+    Ganancia = datos_apuesta_rf$Ganancia
+  )
+
+  ganancias_rf[i] <- ganancia_total_rf
+  rois_rf[i] <- roi_rf
+}
+
+datos_apuesta_rf <- bind_rows(datos_apuesta_rf_lista)
+
+prec_global <- round(confusionMatrix(datos_apuesta_rf$Resultado_Predicho, datos_apuesta_rf$Resultado)$overall["Accuracy"], 3)
+prec_clase <- round(confusionMatrix(datos_apuesta_rf$Resultado_Predicho, datos_apuesta_rf$Resultado)$byClass[, "Sensitivity"], 3)
+names(prec_clase) <- c("Empate", "Vctoria Local", "Victoria Visitante")
+tabla_prec_apuesta <- data.frame(
+  Clase = c(names(prec_clase), "Global"),
+  `Precisión` = c(prec_clase, prec_global)
+)
+
+kable(tabla_prec_apuesta,
+      format = "latex",
+      caption = "Precisión media 2023/2024 (Modelo 5)",
+      booktabs = TRUE,
+      row.names = FALSE,
+      align = "c") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Por su parte, el rendimiento económico obtenido tras aplicar los 100 modelos entrenados a la estrategia de apuestas explicada viene dado por los siguientes resultados:
+
+```{r gananciaMod5, results='asis'}
+cat("\\textbf{Ganancia neta media:} ", round(mean(ganancias_rf), 2), "\n")
+```
+
+```{r ROIMod5, results='asis'}
+cat("\\textbf{Retorno medio de la inversión (ROI):} ", round(mean(rois_rf) * 100, 2), "%\n")
+```
+
+La ganancia neta media esperada, calculada a partir de los 100 modelos desarrollados, es de 20.22€. Por tanto, hemos desarrollado un modelo que, en promedio, genera un retorno económico positivo. 
+El retorno medio esperado (ROI) sobre el dinero total apostado es del 5,32 %.
+
+Se abren ahora dos vías de estrategias de apuesta distintas: 
+
+La primera de ellas consiste en utilizar los 100 modelos entrenados, es decir, para cada partido tenemos 100 predicciones divididas entre los 3 posibles resultados. Entonces, para ser continuista con el enfoque de apostar una unidad monetaria (1€) a cada partido, el plan se basaría en apostar en céntimos a cada resultado el porcentaje de modelos que lo predicen, esto es, si para un partido determinado se tiene que el 70% de los modelos predice Victoria Local, el 20% Empate y el 10% Victoria Visitante, pues se apostarían 0.70€ a Victoria Local, 0.20€ a Empate y 0.10€ a Victoria Visitante. Con este enfoque se cumple que la ganancia neta esperada es igual a la media de las ganancias individuales (calculada anteriormente). Más adelante veremos que esta estrategia es más conservadora porque se espera una ganancia positiva, y el intervalo de confianza es poco amplio y no contiene valores negativos. 
+
+La segunda estrategia se basa en entrenar en condiciones similares un solo modelo nuevo y apostar 1€ al resultado de cada partido según su predicción. A continuación, se demostrará que esta estrategia es más arriesgada que la anterior, pero también puede generar mayores beneficios, puesto que el intervalo de confianza de la ganancia neta esperada es mucho más amplio por ambos lados.
+
+Ahora calcularemos intervalos de confianza al 95 % para la media de las ganancias obtenidas al utilizar los 100 modelos, así como para la ganancia puntual al seleccionar un único modelo de forma aleatoria. Primero veamos si la variable ganancias sigue una distribución normal mediante gráficos y el test de Shapiro-Wilk.
+
+```{r DistNormalMod5, fig.cap="Gráficos de normalidad para las ganancias (Modelo 5)", fig.pos='!htbp', fig.align='center', fig.width=12, fig.height=4, results='asis'}
+par(mfrow = c(1, 3))  
+boxplot(ganancias_rf, main = "Boxplot ganancias")
+hist(ganancias_rf, main = "Histograma ganancias", xlab = "Ganancia",
+     col = "lightblue", breaks = 20)
+
+curve(
+  dnorm(x, mean = mean(ganancias_rf), sd = sd(ganancias_rf)) * length(ganancias_rf) *
+    diff(hist(ganancias_rf, plot = FALSE)$breaks)[1],
+  add = TRUE,
+  col = "red",
+  lwd = 2
+)
+
+plot.new()  
+text(0.5, 0.6, paste("Shapiro-Wilk p-value:\n", round(shapiro.test(ganancias_rf)$p.value, 4)),
+     cex = 1.4)
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Como el valor-p del test de Shapiro-Wilk es 0.9171 > 0.05, no podemos rechazar la hipótesis nula de normalidad. Por tanto, asumimos que las ganancias siguen una distribución normal.
+
+Como además se desconoce la varianza poblacional, los intervalos de confianza al 95% para la media de las ganancias (usando 100 modelos) y para un único modelo nuevo (aleatorio) se calculan utilizando la distribución t de Student.
+El IC al 95% para la media poblacional $\mu$ (ganancia media al usar 100 modelos) es: 
+
+$$
+\bar{x} \pm t_{\alpha/2,\, n-1} \cdot \left( \frac{s}{\sqrt{n}} \right) \quad\quad \text{donde:}
+$$
+
+-   $\bar{x}$ es la media muestral.
+-   $s$ es la desviación estándar muestral.
+-   $n$ es el tamaño de la muestra (100 en este caso).
+-   $t_{\alpha/2,\, n-1}$ es el valor crítico de la t de Student con $n-1$ grados de libertad.
+
+Se obtiene el siguiente resultado:
+
+```{r results='asis'}
+media_ganancias <- mean(ganancias_rf)
+n <- length(ganancias_rf)
+error1 <- qt(0.975, df = n - 1) * sd(ganancias_rf) / sqrt(n)  # IC al 95%
+
+IC_estrategia1 <- c(media_ganancias - error1, media_ganancias + error1)
+
+# El IC del ROI (retorno económico) es:
+IC_ROI_1 <- IC_estrategia1 / 380 * 100
+
+tabla_ic <- data.frame(
+  Metrica = c("Ganancia neta media", "ROI"),
+  LimiteInferior = c(
+    paste0(round(IC_estrategia1[1], 2), " €"),
+    paste0(round(IC_ROI_1[1], 2), " \\%")
+  ),
+  LimiteSuperior = c(
+    paste0(round(IC_estrategia1[2], 2), " €"),
+    paste0(round(IC_ROI_1[2], 2), " \\%")
+  )
+)
+
+kable(tabla_ic,
+      format = "latex",
+      caption = "IC al 95\\% para las ganancias - Estrategia conservadora (Modelo 5)",
+      booktabs = TRUE,
+      align = "c",
+      escape = FALSE) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"))
+#cat("\\textbf{Intervalo de confianza (95%) para la ganancia neta esperada:}\n",
+#    "[", round(IC_estrategia1[1], 2), "€,", round(IC_estrategia1[2], 2), "€ ]\n\n")
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Como se puede observar, la ganancia neta esperada se sitúa en un rango positivo, lo que sugiere que esta estrategia de apuestas, en media, es rentable; además de conservadora, pues el intervalo de confianza es relativamente estrecho.
+
+El IC para la ganancia neta esperada de un nuevo modelo aleatorio entrenado bajo las mismas condiciones es:
+
+$$
+\bar{x} \pm t_{\alpha/2,\, n-1} \cdot \left( s \cdot \sqrt{1 + \frac{1}{n}} \right)
+$$
+
+
+```{r results='asis'}
+error2 <- qt(0.975, df = n - 1) * sd(ganancias_rf) * sqrt(1 + 1/n)  # IC del 95% para nueva obs
+
+IC_estrategia2 <- c(media_ganancias - error2, media_ganancias + error2)
+
+# El IC del ROI (retorno económico) es:
+IC_ROI_2 <- IC_estrategia2 / 380 * 100
+
+tabla_ic_2 <- data.frame(
+  Metrica = c("Ganancia neta esperada", "ROI"),
+  LimiteInferior = c(
+    paste0(round(IC_estrategia2[1], 2), " €"),
+    paste0(round(IC_ROI_2[1], 2), " \\%")
+  ),
+  LimiteSuperior = c(
+    paste0(round(IC_estrategia2[2], 2), " €"),
+    paste0(round(IC_ROI_2[2], 2), " \\%")
+  )
+)
+
+kable(tabla_ic_2,
+      format = "latex",
+      caption = "IC al 95\\% para las ganancias - Estrategia arriesgada (Modelo 5)",
+      booktabs = TRUE,
+      align = "c",
+      escape = FALSE) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"))
+
+#cat("\\textbf{Intervalo de confianza (95%) para la ganancia neta esperada:}\n",
+#    "[", round(IC_estrategia2[1], 2), "€,", round(IC_estrategia2[2], 2), "€ ]\n\n")
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+La variabilidad es considerablemente mayor que en la estrategia conservadora, pues los intervalos de confianza son mucho más amplios. Esta estrategia es más arriesgada, pero también puede generar mayores beneficios.
+
+Ahora realizaremos un análisis de las ganancias obtenidas por cada tipo de apuesta: 'Victoria Local', 'Empate' y 'Victoria Visitante'.
+
+```{r tablaTipoApuestaMod5, results='asis'}
+resumen_apuestas <- datos_apuesta_rf %>%
+  group_by(Modelo, Resultado_Predicho) %>%
+  summarise(
+    Apuestas = n(),
+    Ganancia = sum(Ganancia, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(Resultado_Predicho) %>%
+  summarise(
+    Apuestas_Medias = mean(Apuestas),
+    Ganancia_Media = mean(Ganancia),
+    ROI_Medio = Ganancia_Media / Apuestas_Medias,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(ROI_Medio))
+
+resumen_apuestas %>%
+  kable(format = "latex", caption = "Ganancias por tipo de apuesta (Modelo 5)", booktabs = TRUE, row.names = FALSE, align = "c", digits = 2) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down", "condensed"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+```{r grafTipoApuestaMod5, fig.cap="Ganancias por tipo de apuesta (Modelo 5)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+ggplot(resumen_apuestas, aes(x = Resultado_Predicho, y = ROI_Medio, fill = Resultado_Predicho)) +
+  geom_bar(stat = "identity") +
+  labs(title = "ROI Medio por Tipo de Apuesta", x = "Tipo de Apuesta", y = "ROI Medio") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Se percibe que las apuestas a empates o victorias visitante son consistentes, pues generan retornos económicos del 13% y 10%, respectivamente. Por otra parte, las apuestas a victorias locales generan una mínima pérdida (1%) a lo largo de la temporada.
+
+Hacemos ahora un análisis por rangos de cuotas, los cuales son los siguientes:
+
+-   Bajas: Cuotas entre 1.00 y 1.50
+-   Medias: Cuotas entre 1.51 y 2.00
+-   Altas: Cuotas entre 2.01 y 3.00
+-   Muy Altas: Cuotas superiores a 3.00
+
+```{r tablaCuotaMod5, results='asis'}
+datos_apuesta_rf <- datos_apuesta_rf %>%
+  mutate(Cuota_Predicha = case_when(
+    Resultado_Predicho == "Victoria Local" ~ Cuota_Victoria_Local,
+    Resultado_Predicho == "Empate" ~ Cuota_Empate,
+    Resultado_Predicho == "Victoria Visitante" ~ Cuota_Victoria_Visitante,
+    TRUE ~ NA_real_
+  ),
+  Rango_Cuota = cut(
+    Cuota_Predicha,
+    breaks = c(0, 1.5, 2, 3, Inf),
+    labels = c("Bajas", "Medias", "Altas", "Muy Altas"),
+    right = FALSE
+  ))
+
+resumen_cuotas <- datos_apuesta_rf %>%
+  group_by(Modelo, Rango_Cuota) %>%
+  summarise(
+    Apuestas = n(),
+    Ganancia = sum(Ganancia, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(Rango_Cuota) %>%
+  summarise(
+    Apuestas_Medias = mean(Apuestas),
+    Ganancia_Media = mean(Ganancia),
+    ROI_Medio = Ganancia_Media / Apuestas_Medias,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(ROI_Medio))
+
+resumen_cuotas %>%
+  kable(format = "latex", caption = "Ganancias por rango de cuotas (Modelo 5)", booktabs = TRUE, row.names = FALSE, align = "c", digits = 2) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down", "condensed"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+```{r grafCuotaMod5, fig.cap="Ganancias por rango de cuotas (Modelo 5)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+ggplot(resumen_cuotas, aes(x = Rango_Cuota, y = ROI_Medio, fill = Rango_Cuota)) +
+  geom_bar(stat = "identity") +
+  labs(title = "ROI Medio por Rango de Cuota", x = "Rango de Cuota", y = "ROI Medio") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+En este caso, las únicas cuotas que parecen rentables económicamente a largo plazo son las cuotas bajas y las muy altas, originando retornos del 12% y 9%, correspondientemente. Las cuotas medias y altas no son muy beneficiosas en términos económicos.
+
+A continuación, analizamos el desempeño de cada equipo por separado, según jueguen como local o como visitante. Cabe destacar que cada equipo juega 19 partidos como local y otros 19 como visitante a lo largo del campeonato.
+
+```{r}
+datos_apuesta_rf$EquipoLocal <- rep(datos23_24$EquipoLocal, n_iter)
+datos_apuesta_rf$EquipoVisitante <- rep(datos23_24$EquipoVisitante, n_iter)
+
+# Local
+resumen_local <- datos_apuesta_rf %>%
+  group_by(Modelo, EquipoLocal) %>%
+  summarise(
+    Apuestas = n(),
+    Ganancia = sum(Ganancia, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(EquipoLocal) %>%
+  summarise(
+    Apuestas_Medias = mean(Apuestas),
+    Ganancia_Media = mean(Ganancia),
+    ROI_Medio = Ganancia_Media / Apuestas_Medias,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(ROI_Medio))
+
+#print(resumen_local)
+
+# Visitante
+resumen_visitante <- datos_apuesta_rf %>%
+  group_by(Modelo, EquipoVisitante) %>%
+  summarise(
+    Apuestas = n(),
+    Ganancia = sum(Ganancia, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(EquipoVisitante) %>%
+  summarise(
+    Apuestas_Medias = mean(Apuestas),
+    Ganancia_Media = mean(Ganancia),
+    ROI_Medio = Ganancia_Media / Apuestas_Medias,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(ROI_Medio))
+
+#print(resumen_visitante)
+```
+
+
+```{r grafEquipoLocalMod5, fig.cap="Ganancias por equipo local (Modelo 5)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+ggplot(resumen_local, aes(x = reorder(EquipoLocal, ROI_Medio), y = ROI_Medio, fill = EquipoLocal)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "ROI Medio por Equipo Local", x = "Equipo Local", y = "ROI Medio") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Cuando juegan como local, los equipos que generan un mayor retorno económico son el Cádiz, el real Madrid y el Betis, obteniéndose una ganancia neta que supera el 30% del dinero total apostado en los 19 partidos que cada uno disputó en casa. Estas son cifras bastante positivas. En cuanto a los equipos que originan pérdidas, los más considerables son Sevilla, Villarreal y Athletic de Bilbao, con cantidades algo mayores del 20%.
+
+```{r grafEquipoVisitMod5, fig.cap="Ganancias por equipo visitante (Modelo 5)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+ggplot(resumen_visitante, aes(x = reorder(EquipoVisitante, ROI_Medio), y = ROI_Medio, fill = EquipoVisitante)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "ROI Medio por Equipo Visitante", x = "Equipo Visitante", y = "ROI Medio") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Por otro lado, cuando juegan a domicilio, la Real Sociedad genera un retorno económico de aproximadamente el 75%, una cantidad realmente alta. Seguidamente aparecen Sevilla y Granada, con retornos alrededor del 55% y 50%, respectivamente. Son cifras inferiores a la de la Real Sociedad, pero siguen siendo muy altas y relevantes. En el extremo contrario se encuentra el Betis, el cual provoca pérdidas de algo menos del 50% sobre el total invertido.
+
+# Modelo 6: XGBoost para la predicción del resultado
+
+En este apartado se aplica un modelo basado en XGBoost para la clasificación del resultado de los partidos de fútbol (victoria local, empate o victoria visitante). Al igual que en el modelo de Random Forest, la variable respuesta es categórica y se emplean las mismas covariables y conjunto de datos. El modelo será entrenado y ajustado mediante validación cruzada para optimizar sus parámetros. El objetivo, al igual que antes, es construir una estrategia de apuestas que maximice la rentabilidad a partir de las predicciones del resultado final.
+
+```{r}
+#library(dplyr)
+EloRatings <- read.csv("C:/Users/pablo/OneDrive/Escritorio/UNIVERSIDAD 24-25/TFG/R/EloRatings.csv", stringsAsFactors=TRUE)
+
+EloRatings$date <- as.Date(EloRatings$date)
+
+#Nos quedamos con los equipos españoles, la fecha de 2018 a 2024, y con los equipos que han estado en primera división en las temporadas a estudiar:
+datosELO <- EloRatings %>%
+  filter(country == "ESP", date >= "2018-08-01", date <= "2024-06-01", club %in% c(levels(datos$EquipoLocal), "Las Palmas")) %>%
+  droplevels()
+
+datosELO <- datosELO %>%
+  rename(Fecha_ELO = date, Club = club, Elo = elo)
+```
+
+```{r}
+#library(dplyr)
+#library(readxl)
+#library(purrr)
+
+
+datos_XGB <- datos %>%
+  mutate(PartidoID = row_number()) %>%
+  mutate(Equipo = EquipoLocal, Rival = EquipoVisitante) %>%
+  select(PartidoID, Fecha, Equipo, Rival, Resultado)
+
+ruta_excel <- "C:/Users/pablo/OneDrive/Escritorio/UNIVERSIDAD 24-25/TFG/R/RF_Covariables.xlsx"
+hojas <- excel_sheets(ruta_excel)
+
+suppressWarnings({
+  covariables <- map(hojas, ~ read_excel(ruta_excel, sheet = .x) %>%
+                       mutate(Temporada = .x)) %>%
+    map(~ .x %>%
+          mutate(across(c(Equipo, UCL, UEL), as.factor)))  # 
+})
+
+covariables_combinadas <- bind_rows(covariables) %>%
+  mutate(Temporada = as.character(Temporada))
+
+datos_XGB <- datos_XGB %>%
+  mutate(Temporada = case_when(
+    Fecha >= "2018-08-01" & Fecha < "2019-07-01" ~ "18-19",
+    Fecha >= "2019-08-01" & Fecha < "2020-07-30" ~ "19-20",
+    Fecha >= "2020-08-01" & Fecha < "2021-07-01" ~ "20-21",
+    Fecha >= "2021-08-01" & Fecha < "2022-07-01" ~ "21-22",
+    Fecha >= "2022-08-01" & Fecha < "2023-07-01" ~ "22-23",
+    Fecha >= "2023-08-01" ~ "23-24"
+  ))
+
+datos_XGB <- datos_XGB %>%
+  left_join(covariables_combinadas, by = c("Equipo" = "Equipo", "Temporada")) %>%
+  left_join(covariables_combinadas, by = c("Rival" = "Equipo", "Temporada"), suffix = c("_E", "_R"))
+
+variables_originales <- c("Pts", "Pos", "GF", "GC", "ValorMercado", "EdadMedia", "Gasto")
+
+for (var in variables_originales) {
+  datos_XGB[[paste0(var, "_Dif")]] <- datos_XGB[[paste0(var, "_E")]] - datos_XGB[[paste0(var, "_R")]]
+}
+
+datos_XGB <- datos_XGB %>%
+  mutate(Fecha_ELO = as.Date(ifelse(lubridate::day(Fecha) < 15,
+                                    paste0(lubridate::year(Fecha), "-", lubridate::month(Fecha), "-01"),
+                                    paste0(lubridate::year(Fecha), "-", lubridate::month(Fecha), "-15"))))
+
+datos_XGB <- datos_XGB %>%
+  left_join(datosELO, by = c("Fecha_ELO" = "Fecha_ELO", "Equipo" = "Club")) %>%
+  rename(Elo_Equipo = Elo)
+datos_XGB <- datos_XGB %>%
+  left_join(datosELO, by = c("Fecha_ELO" = "Fecha_ELO", "Rival" = "Club")) %>%
+  rename(Elo_Rival = Elo)
+datos_XGB <- datos_XGB %>%
+  mutate(Elo_Dif = Elo_Equipo - Elo_Rival)
+
+columnas_dif <- c("Pts_Dif", "Pos_Dif", "GF_Dif", "GC_Dif", "ValorMercado_Dif", "EdadMedia_Dif", "Gasto_Dif", "Elo_Dif")
+
+datos_XGB <- datos_XGB %>%
+  select(PartidoID, Temporada, Fecha, Equipo, Rival, Resultado, all_of(columnas_dif)) %>%
+  na.omit()
+
+datos_XGB$Resultado <- factor(datos_XGB$Resultado)
+```
+
+```{r}
+#library(xgboost)
+#library(caret)
+
+train <- datos_XGB %>% filter(Temporada %in% c("18-19", "19-20", "20-21", "21-22"))
+test <- datos_XGB %>% filter(Temporada == "22-23")
+
+X_train <- as.matrix(train[, columnas_dif])
+X_test <- as.matrix(test[, columnas_dif])
+
+y_train <- train$Resultado
+y_test <- test$Resultado
+```
+
+Dividimos los datos en entrenamiento (18/19 - 21/22) y test (22/23) de forma idéntica al modelo previo.
+Como el conjunto de entrenamiento está desbalanceado porque hay bastantes más observaciones de victorias locales que de empates y victorias visitantes, asignamos pesos a las clases para compensar este desequilibrio, penalizando así en mayor medida los errores en las clases minoritarias.
+
+```{r}
+tabla_clases <- table(y_train)
+frecuencias <- as.numeric(tabla_clases)
+pesos_clase <- (sum(frecuencias) / frecuencias)
+pesos_clase <- pesos_clase / sum(pesos_clase)
+#pesos_clase <- c(0.40, 0.20, 0.40)
+names(pesos_clase) <- names(tabla_clases)
+pesos_entrenamiento <- pesos_clase[as.character(y_train)]
+train$pesos <- pesos_entrenamiento
+
+dtrain <- xgb.DMatrix(data = X_train, label = y_train, weight = pesos_entrenamiento)
+dtest <- xgb.DMatrix(data = X_test, label = y_test)
+```
+
+```{r}
+#library(dplyr)
+#library(readxl)
+#library(purrr)
+
+datos_XGB_23_24 <- datos23_24 %>%
+  mutate(PartidoID = row_number()) %>%
+  mutate(Equipo = EquipoLocal, Rival = EquipoVisitante) %>%
+  select(PartidoID, Fecha, Equipo, Rival, Resultado)
+
+ruta_excel <- "C:/Users/pablo/OneDrive/Escritorio/UNIVERSIDAD 24-25/TFG/R/RF_Covariables.xlsx"
+hojas <- excel_sheets(ruta_excel)
+
+suppressWarnings({
+  covariables <- map(hojas, ~ read_excel(ruta_excel, sheet = .x) %>%
+                       mutate(Temporada = .x)) %>%
+    map(~ .x %>%
+          mutate(across(c(Equipo, UCL, UEL), as.factor)))  # 
+})
+
+covariables_combinadas <- bind_rows(covariables) %>%
+  mutate(Temporada = as.character(Temporada))
+
+datos_XGB_23_24 <- datos_XGB_23_24 %>%
+  mutate(Temporada = case_when(
+    Fecha >= "2018-08-01" & Fecha < "2019-07-01" ~ "18-19",
+    Fecha >= "2019-08-01" & Fecha < "2020-07-30" ~ "19-20",
+    Fecha >= "2020-08-01" & Fecha < "2021-07-01" ~ "20-21",
+    Fecha >= "2021-08-01" & Fecha < "2022-07-01" ~ "21-22",
+    Fecha >= "2022-08-01" & Fecha < "2023-07-01" ~ "22-23",
+    Fecha >= "2023-08-01" ~ "23-24"
+  ))
+
+datos_XGB_23_24 <- datos_XGB_23_24 %>%
+  left_join(covariables_combinadas, by = c("Equipo" = "Equipo", "Temporada")) %>%
+  left_join(covariables_combinadas, by = c("Rival" = "Equipo", "Temporada"), suffix = c("_E", "_R"))
+
+variables_originales <- c("Pts", "Pos", "GF", "GC", "ValorMercado", "EdadMedia", "Gasto")
+
+for (var in variables_originales) {
+  datos_XGB_23_24[[paste0(var, "_Dif")]] <- datos_XGB_23_24[[paste0(var, "_E")]] - datos_XGB_23_24[[paste0(var, "_R")]]
+}
+
+datos_XGB_23_24 <- datos_XGB_23_24 %>%
+  mutate(Fecha_ELO = as.Date(ifelse(lubridate::day(Fecha) < 15,
+                                    paste0(lubridate::year(Fecha), "-", lubridate::month(Fecha), "-01"),
+                                    paste0(lubridate::year(Fecha), "-", lubridate::month(Fecha), "-15"))))
+
+datos_XGB_23_24 <- datos_XGB_23_24 %>%
+  left_join(datosELO, by = c("Fecha_ELO" = "Fecha_ELO", "Equipo" = "Club")) %>%
+  rename(Elo_Equipo = Elo)
+
+datos_XGB_23_24 <- datos_XGB_23_24 %>%
+  left_join(datosELO, by = c("Fecha_ELO" = "Fecha_ELO", "Rival" = "Club")) %>%
+  rename(Elo_Rival = Elo)
+
+datos_XGB_23_24 <- datos_XGB_23_24 %>%
+  mutate(Elo_Dif = Elo_Equipo - Elo_Rival)
+
+columnas_dif <- c("Pts_Dif", "Pos_Dif", "GF_Dif", "GC_Dif", "ValorMercado_Dif", "EdadMedia_Dif", "Gasto_Dif", "Elo_Dif")
+
+datos_XGB_23_24 <- datos_XGB_23_24 %>%
+  select(PartidoID, Temporada, Fecha, Equipo, Rival, Resultado, all_of(columnas_dif)) %>%
+  na.omit()
+
+datos_XGB_23_24$Resultado <- factor(datos_XGB_23_24$Resultado,
+                             levels = c("Victoria Local", "Empate", "Victoria Visitante"),
+                             labels = c(0, 1, 2))
+datos_XGB_23_24$Resultado <- as.numeric(as.character(datos_XGB_23_24$Resultado))
+
+X_test_23_24 <- as.matrix(datos_XGB_23_24[, columnas_dif])
+y_test_23_24 <- datos_XGB_23_24$Resultado
+dtest_23_24 <- xgb.DMatrix(data = X_test_23_24, label = y_test_23_24)
+```
+
+Para ajustar el modelo XGBoost, se realizará una validación cruzada de 5 pliegues. El objetivo de este procedimiento es seleccionar la mejor combinación de hiperparámetros para el modelo. Algunos hiperparámetros del modelo se mantienen fijos durante el proceso:
+
+-   *gamma* = 1
+-   *colsample_bytree* = 0,8
+-   *min_child_weight* = 1
+-   *subsample* = 0,8
+
+Se probarán distintas combinaciones con el resto de hiperparámetros, generando una rejilla (grid) de búsqueda aleatoria:
+
+-   *nrounds*: número de iteraciones (valores considerados: 100, 200, 300, 400)
+-   *max_depth*: profundidad máxima de los árboles (3, 5, 7, 9)
+-   *eta*: tasa de aprendizaje (0.05, 0.075, 0.10, 0.15)
+
+De todas las combinaciones posibles, se selecciona aleatoriamente un subconjunto de 40 configuraciones para reducir el coste computacional.
+
+El criterio principal para seleccionar la mejor combinación de hiperparámetros es la maximización de la precisión media en las clases minoritarias: "Empate" y "Victoria Visitante", aunque también se tendrá en cuenta la precisión global para no comprometer el rendimiento general del modelo.
+
+```{r cvMod6, results='asis'}
+mi_summary_completo <- function(data, lev = NULL, model = NULL) {
+  cm <- confusionMatrix(data$pred, data$obs)
+  accuracy <- cm$overall["Accuracy"]
+  s_local <- cm$byClass["Class: Victoria Local", "Sensitivity"]
+  s_empate <- cm$byClass["Class: Empate", "Sensitivity"]
+  s_visitante <- cm$byClass["Class: Victoria Visitante", "Sensitivity"]
+  media_emp_vis <- mean(c(s_empate, s_visitante), na.rm = TRUE)
+
+  return(c(Prec_Global = accuracy,
+           Prec_Loc = s_local,
+           Prec_Emp = s_empate,
+           Prec_Visit = s_visitante,
+           PrecMedia_Emp_Visit = media_emp_vis))
+}
+
+control <- trainControl(method = "cv",
+                        number = 5,
+                        summaryFunction = mi_summary_completo,
+                        classProbs = FALSE,
+                        verboseIter = FALSE,
+                        search = "random")
+
+xgb_grid <- expand.grid(
+  nrounds = c(100, 200, 300, 400),
+  max_depth = c(3, 5, 7, 9),
+  eta = c(0.05, 0.075, 0.10, 0.15),
+  gamma = 1,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  subsample = 0.8
+)
+
+set.seed(10)
+xgb_grid <- xgb_grid[sample(nrow(xgb_grid), 40), ]
+
+invisible(capture.output({
+modelo_xgb <- train(
+  Resultado ~ . - Temporada - pesos - PartidoID - Fecha - Equipo - Rival,  
+  data = train,
+  method = "xgbTree",
+  weights = train$pesos,
+  trControl = control,
+  tuneGrid = xgb_grid,
+  metric = "Accuracy"
+)
+}))
+#print(modelo_xgb)
+
+ resultados_cv_mod6 <-modelo_xgb$results %>%
+   arrange(desc(Prec_Global.Accuracy)) %>%
+   slice_head(n = 5) %>%
+   bind_rows(
+     modelo_xgb$results %>%
+       arrange(desc(PrecMedia_Emp_Visit)) %>%
+       slice_head(n = 5)
+   ) %>%
+   distinct() %>%
+   arrange(desc(PrecMedia_Emp_Visit)) %>%
+   rename(Prec_Global = Prec_Global.Accuracy) %>%
+   select(eta, max_depth, nrounds, Prec_Global, PrecMedia_Emp_Visit, Prec_Loc, Prec_Emp, Prec_Visit) 
+ 
+resultados_cv_mod6 %>%
+  kable(format = "latex", caption = "Mejores modelos validación cruzada (Modelo 6)", booktabs = TRUE, row.names = FALSE, align = "c", digits = 4) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down", "condensed"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Se detecta que la combinación de hiperparámetros *eta* = 0.075, *max_depth* = 9 y *nrounds* = 100 es la que proporciona la mayor precisión media en las clases minoritarias ("Empate" y "Victoria Visitante"), con un valor de 0,4224. Además, su precisión global (0,4711) se encuentra muy próxima al máximo observado, lo que la convierte en una opción equilibrada y robusta. Por tanto, seleccionamos esta combinación como la óptima para el modelo, al priorizar un buen rendimiento en las clases minoritarias sin sacrificar la precisión total del modelo.
+
+Siguiendo la línea del Random Forest, para evaluar la generalización del modelo sobre datos no vistos, se generan 50 modelos aleatorios independientes con los hiperparámetros seleccionados sobre el conjunto test. Se obtienen los siguientes resultados:
+
+```{r evalTestMod6, results='asis'}
+#library(xgboost)
+#library(caret)
+
+set.seed(10)
+n_sim <- 50
+
+precisiones_xgb <- numeric(n_sim)
+sensitividades_xgb <- matrix(NA, nrow = n_sim, ncol = 3)
+
+# Hiperparámetros óptimos de caret
+best_params <- list(
+  eta = 0.075,
+  max_depth = 9,
+  objective = "multi:softmax",
+  num_class = 3,
+  eval_metric = "merror",
+  colsample_bytree = 0.8,
+  colsample_bynode = 0.8,
+  subsample = 0.8,
+  min_child_weight = 1,
+  gamma = 1
+)
+
+X_train <- as.matrix(train[, columnas_dif])
+y_train <- as.numeric(factor(train$Resultado, levels = c("Empate", "Victoria Local", "Victoria Visitante"))) - 1
+X_test <- as.matrix(test[, columnas_dif])
+y_test <- as.numeric(factor(test$Resultado, levels = c("Empate", "Victoria Local", "Victoria Visitante"))) - 1
+
+dtrain <- xgb.DMatrix(data = X_train, label = y_train, weight = pesos_entrenamiento)
+dtest <- xgb.DMatrix(data = X_test, label = y_test)
+
+for (i in 1:n_sim) {
+  pesos_entrenamiento <- pesos_clase[as.character(train$Resultado)]
+  
+  modelo_xgb <- xgb.train(
+    params = best_params,
+    data = dtrain,
+    nrounds = 100,
+    verbose = 0
+  )
+  
+  pred <- predict(modelo_xgb, newdata = X_test)
+  pred_factor <- factor(pred,
+                        levels = 0:2,
+                        labels = c("Empate", "Victoria Local", "Victoria Visitante"))
+  y_test_factor <- factor(y_test,
+                        levels = 0:2,
+                        labels = c("Empate", "Victoria Local", "Victoria Visitante"))
+  cm <- confusionMatrix(pred_factor, y_test_factor)
+  precisiones_xgb[i] <- cm$overall["Accuracy"]
+  sensitividades_xgb[i, ] <- cm$byClass[, "Sensitivity"]
+}
+
+prec_clase <- round(colMeans(sensitividades_xgb), 3)
+names(prec_clase) <- c("Empate", "Victoria Local", "Victoria Visitante")
+prec_global <- round(mean(precisiones_xgb), 3)
+tabla_prec <- data.frame(
+  Clase = c(names(prec_clase), "Global"),
+  `Precisión Media` = c(prec_clase, prec_global)
+)
+
+kable(tabla_prec,
+      format = "latex",
+      caption = "Precisión media conjunto test (Modelo 6)",
+      booktabs = TRUE,
+      row.names = FALSE,
+      align = "c") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"))
+
+#cat("\\textbf{Precisión media global (XGBoost):} ", round(mean(precisiones_xgb), 3), " \\\\ \n")
+#cat("\\textbf{Precisión media por clase:} \\\\ \n")
+#prec_clase_xgb <- round(colMeans(sensitividades_xgb), 3)
+#names(prec_clase_xgb) <- c("Empate", "Victoria Local", "Victoria Visitante")
+#print(prec_clase_xgb)
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+En comparación con el Random Forest, el modelo basado en XGBoost presenta una ligera disminución en la precisión global (0,489 frente a 0,52). Sin embargo, logra una mejor precisión en la clase "Victoria Visitante" (0,531 frente a 0,487), lo cual es especialmente relevante teniendo en cuenta que esta clase suele tener las cuotas de apuestas más altas. Por el contrario, la precisión en la clase "Victoria Local" disminuye levemente, y la clase "Empate" se mantiene con una precisión similar. En resumen, aunque el rendimiento global es algo inferior, XGBoost puede ser preferible para obtener mejores resultados económicos, pues parece que acierta con mayor precisión las victorias a domicilio, las cuales suelen ofrecer las mayores cuotas en el mercado de apuestas.
+
+## Estrategia de apuestas
+
+Seguidamente, se aplica el mismo procedimiento que en el modelo previo sobre la temporada 2023/2024. Las precisiones global y por clases sobre esta nueva temporada vienen dadas por:
+
+```{r precisionMod6, results='asis'}
+set.seed(10) 
+n_iter <- 100
+
+ganancias <- numeric(n_iter)
+rois <- numeric(n_iter)
+datos_apuesta_6_lista <- list()
+
+for (i in 1:n_iter) {
+
+  params <- list(
+    eta = 0.075,
+    max_depth = 9,
+    objective = "multi:softmax",
+    num_class = 3,
+    eval_metric = "merror",
+    colsample_bytree = 0.8,
+    subsample = 0.8,
+    min_child_weight = 1,
+    gamma = 1
+  )
+
+  modelo_xgb_pesos <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 100,
+    verbose = 0  
+  )
+
+  # Predicción 23/24
+  pred_XGB_23_24 <- predict(modelo_xgb_pesos, dtest_23_24)
+
+  pred_XGB_23_24_etiqueta <- factor(pred_XGB_23_24,
+                            levels = c(0, 1, 2),
+                            labels = c("Empate", "Victoria Local", "Victoria Visitante"))
+
+  datos_apuesta_XGB <- bind_cols(pred_XGB_23_24_etiqueta, cuotas_23_24)
+
+  datos_apuesta_XGB <- datos_apuesta_XGB %>%
+    select(Resultado, 1, Cuota_Victoria_Local, Cuota_Empate, Cuota_Victoria_Visitante)
+
+  colnames(datos_apuesta_XGB) <- c("Resultado", "Resultado_Predicho",
+                                   "Cuota_Victoria_Local", "Cuota_Empate", "Cuota_Victoria_Visitante")
+
+  datos_apuesta_XGB$Ganancia <- mapply(simular_apuesta,
+                                       datos_apuesta_XGB$Resultado_Predicho,
+                                       datos_apuesta_XGB$Resultado,
+                                       datos_apuesta_XGB$Cuota_Victoria_Local,
+                                       datos_apuesta_XGB$Cuota_Empate,
+                                       datos_apuesta_XGB$Cuota_Victoria_Visitante)
+
+  ganancia_total <- sum(datos_apuesta_XGB$Ganancia, na.rm = TRUE)
+  ri <- ganancia_total / nrow(datos_apuesta_XGB)
+  
+  datos_apuesta_6_lista[[i]] <- data.frame(
+    Modelo = i,
+    Resultado = datos_apuesta_XGB$Resultado,
+    Resultado_Predicho = datos_apuesta_XGB$Resultado_Predicho,
+    Cuota_Victoria_Local = datos_apuesta_XGB$Cuota_Victoria_Local,
+    Cuota_Empate = datos_apuesta_XGB$Cuota_Empate,
+    Cuota_Victoria_Visitante = datos_apuesta_XGB$Cuota_Victoria_Visitante,
+    Ganancia = datos_apuesta_XGB$Ganancia
+  )
+
+
+  ganancias[i] <- ganancia_total
+  rois[i] <- ri
+}
+
+# Combinamos resultados de todos los modelos
+datos_apuesta_6 <- bind_rows(datos_apuesta_6_lista)
+prec_global <- round(confusionMatrix(datos_apuesta_6$Resultado_Predicho, datos_apuesta_6$Resultado)$overall["Accuracy"], 3)
+prec_clase <- round(confusionMatrix(datos_apuesta_6$Resultado_Predicho, datos_apuesta_6$Resultado)$byClass[, "Sensitivity"], 3)
+names(prec_clase) <- c("Empate", "Vctoria Local", "Victoria Visitante")
+tabla_prec_apuesta <- data.frame(
+  Clase = c(names(prec_clase), "Global"),
+  `Precisión` = c(prec_clase, prec_global)
+)
+
+kable(tabla_prec_apuesta,
+      format = "latex",
+      caption = "Precisión media 2023/2024 (Modelo 6)",
+      booktabs = TRUE,
+      row.names = FALSE,
+      align = "c") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"))
+
+#cat("\\textbf{Precisión global:}", round(prec, 3), " \\\\ \n")
+#cat("\\textbf{Precisión por clase:} \\\\ \n")
+#print(prec_clase)
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Por su parte, la ganancia obtenida aplicando 100 modelos es la siguiente:
+
+```{r gananciaMod6, results='asis'}
+cat("\\textbf{Ganancia neta media XGB:} ", mean(ganancias), "\n")
+```
+
+```{r ROIMod6, results='asis'}
+cat("\\textbf{ROI medio:} ", mean(rois) * 100, "%\n")
+```
+
+La ganancia neta media esperada a partir de los 100 modelos desarrollados es de 34,74€. Por tanto, hemos desarrollado un modelo que, en media, obtiene un retorno económico positivo, que mejora razonablemente al Random Forest. El retorno medio esperado (ROI) es del 9,14% sobre el dinero total apostado.
+
+Al igual que antes, se abren dos vías de estrategias de apuesta distintas: 
+
+La primera de ellas consiste en utilizar los 100 modelos entrenados, es decir, para cada partido tenemos 100 predicciones divididas entre los 3 posibles resultados. Entonces, para ser continuista con el enfoque de apostar una unidad monetaria (1€) a cada partido, el plan se basaría en apostar en céntimos a cada resultado el porcentaje de modelos que lo predicen, esto es, si para un partido determinado se tiene que el 70% de los modelos predice Victoria Local, el 20% Empate y el 10% Victoria Visitante, pues se apostarían 0.70€ a Victoria Local, 0.20€ a Empate y 0.10€ a Victoria Visitante. Con este enfoque se cumple que la ganancia neta esperada es igual a la media de las ganancias individuales (calculada anteriormente). Más tarde veremos que esta estrategia es más conservadora porque se espera una ganancia positiva, y el intervalo de confianza es poco amplio y no contiene valores negativos. 
+
+La segunda estrategia se basa en entrenar en condiciones similares un solo modelo nuevo y apostar 1€ al resultado de cada partido según su predicción. A continuación, se demostrará que esta estrategia es más arriesgada que la anterior, pero también puede generar mayores beneficios, puesto que el intervalo de confianza de la ganancia neta esperada es mucho más amplio por ambos lados.
+
+Ahora calcularemos intervalos de confianza al 95 % para la media de las ganancias obtenidas al utilizar los 100 modelos, así como para la ganancia puntual al seleccionar un único modelo de forma aleatoria. Primero veamos si la variable ganancias sigue una distribución normal mediante gráficos y el test de Shapiro-Wilk.
+
+```{r DistNormalMod6, fig.cap="Gráficos de normalidad para las ganancias (XGB)", fig.pos='!htbp', fig.align='center', fig.width=12, fig.height=4, results='asis'}
+par(mfrow = c(1, 3))  
+boxplot(ganancias, main = "Boxplot ganancias")
+hist(ganancias, main = "Histograma ganancias", xlab = "Ganancia",
+     col = "lightblue", breaks = 20)
+
+curve(
+  dnorm(x, mean = mean(ganancias), sd = sd(ganancias)) * length(ganancias) *
+    diff(hist(ganancias, plot = FALSE)$breaks)[1],
+  add = TRUE,
+  col = "red",
+  lwd = 2
+)
+
+plot.new()  
+text(0.5, 0.6, paste("Shapiro-Wilk p-value:\n", round(shapiro.test(ganancias)$p.value, 4)),
+     cex = 1.4)
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Como el valor-p del test de Shapiro-Wilk es 0.5957 > 0.05, no podemos rechazar la hipótesis nula de normalidad. Por tanto, asumimos que las ganancias siguen una distribución normal.
+
+Como además se desconoce la varianza poblacional, los intervalos de confianza al 95% para la media de las ganancias (usando 100 modelos) y para un único modelo nuevo (aleatorio) se calculan utilizando la distribución t de Student.
+El IC al 95% para la media poblacional $\mu$ (ganancia media al usar 100 modelos) es: 
+
+$$
+\bar{x} \pm t_{\alpha/2,\, n-1} \cdot \left( \frac{s}{\sqrt{n}} \right)
+$$
+
+Se obtienen entonces los siguientes intervalos de confianza:
+
+```{r results='asis'}
+media_ganancias <- mean(ganancias)
+n <- length(ganancias)
+error1 <- qt(0.975, df = n - 1) * sd(ganancias) / sqrt(n)  # IC al 95%
+
+IC_estrategia1 <- c(media_ganancias - error1, media_ganancias + error1)
+
+# El IC del ROI (retorno económico) es:
+IC_ROI_1 <- IC_estrategia1 / 380 * 100
+
+tabla_ic <- data.frame(
+  Metrica = c("Ganancia neta media", "ROI"),
+  LimiteInferior = c(
+    paste0(round(IC_estrategia1[1], 2), " €"),
+    paste0(round(IC_ROI_1[1], 2), " \\%")
+  ),
+  LimiteSuperior = c(
+    paste0(round(IC_estrategia1[2], 2), " €"),
+    paste0(round(IC_ROI_1[2], 2), " \\%")
+  )
+)
+
+kable(tabla_ic,
+      format = "latex",
+      caption = "IC al 95\\% para las ganancias - Estrategia conservadora (Modelo 6)",
+      booktabs = TRUE,
+      align = "c",
+      escape = FALSE) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"))
+
+#cat("\\textbf{Intervalo de confianza (95%) para la ganancia neta esperada:}\n",
+#    "[", round(IC_estrategia1[1], 2), "€,", round(IC_estrategia1[2], 2), "€ ]\n\n")
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Estos resultados representan una mejora notable respecto al modelo anterior. El intervalo de confianza para el retorno económico es bastante estrecho, lo que indica una alta consistencia en las ganancias esperadas. Además, al situarse cercano al 10%, este retorno se considera muy atractivo para una estrategia de apuestas, reflejando un buen equilibrio entre rentabilidad y estabilidad. 
+
+El IC para la ganancia neta esperada de un nuevo modelo aleatorio entrenado bajo las mismas condiciones es:
+
+$$
+\bar{x} \pm t_{\alpha/2,\, n-1} \cdot \left( s \cdot \sqrt{1 + \frac{1}{n}} \right)
+$$
+
+```{r results='asis'}
+error2 <- qt(0.975, df = n - 1) * sd(ganancias) * sqrt(1 + 1/n)  # IC del 95% para nueva obs
+
+IC_estrategia2 <- c(media_ganancias - error2, media_ganancias + error2)
+
+# El IC del ROI (retorno económico) es:
+IC_ROI_2 <- IC_estrategia2 / 380 * 100
+
+tabla_ic_2 <- data.frame(
+  Metrica = c("Ganancia neta esperada", "ROI"),
+  LimiteInferior = c(
+    paste0(round(IC_estrategia2[1], 2), " €"),
+    paste0(round(IC_ROI_2[1], 2), " \\%")
+  ),
+  LimiteSuperior = c(
+    paste0(round(IC_estrategia2[2], 2), " €"),
+    paste0(round(IC_ROI_2[2], 2), " \\%")
+  )
+)
+
+kable(tabla_ic_2,
+      format = "latex",
+      caption = "IC al 95\\% para las ganancias - Estrategia arriesgada (Modelo 6)",
+      booktabs = TRUE,
+      align = "c",
+      escape = FALSE) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"))
+
+#cat("\\textbf{Intervalo de confianza (95%) para la ganancia neta esperada:}\n",
+#    "[", round(IC_estrategia2[1], 2), "€,", round(IC_estrategia2[2], 2), "€ ]\n\n")
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Estos amplios intervalos reflejan que la estrategia basada en un solo modelo presenta mayor volatilidad e inestabilidad. Por tanto, puede producir resultados tanto modestos como muy exitosos. Sin embargo, incluso el límite inferior del intervalo indica una ganancia económica notable.
+
+Al igual que anteriormente, se realiza un estudio de las ganancias por tipo de apuesta, rango de cuota y equipo, respectivamente.
+
+El análisis por cada tipo de apuesta ('Victoria Local', 'Empate', 'Victoria Visitante') devuelve los siguientes resultados: 
+
+```{r tablaTipoApuestaMod6, results='asis'}
+resumen_apuestas <- datos_apuesta_6 %>%
+  group_by(Modelo, Resultado_Predicho) %>%
+  summarise(
+    Apuestas = n(),
+    Ganancia = sum(Ganancia, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(Resultado_Predicho) %>%
+  summarise(
+    Apuestas_Medias = mean(Apuestas),
+    Ganancia_Media = mean(Ganancia),
+    ROI_Medio = Ganancia_Media / Apuestas_Medias,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(ROI_Medio))
+
+resumen_apuestas %>%
+  kable(format = "latex", caption = "Ganancias por tipo de apuesta (Modelo 6)", booktabs = TRUE, row.names = FALSE, align = "c", digits = 2) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down", "condensed"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+```{r grafTipoApuestaMod6, fig.cap="Ganancias por tipo de apuesta (Modelo 6)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+ggplot(resumen_apuestas, aes(x = Resultado_Predicho, y = ROI_Medio, fill = Resultado_Predicho)) +
+  geom_bar(stat = "identity") +
+  labs(title = "ROI Medio por Tipo de Apuesta", x = "Tipo de Apuesta", y = "ROI Medio") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Con este modelo, los tres tipos de apuesta considerados generan beneficios, situándose las apuestas a empates en primer lugar con un retorno económico neto del 16% sobre el total apostado.
+
+Hacemos ahora un análisis por rangos de cuotas, los cuales son los siguientes:
+
+-   Bajas: Cuotas entre 1.00 y 1.50
+-   Medias: Cuotas entre 1.51 y 2.00
+-   Altas: Cuotas entre 2.01 y 3.00
+-   Muy Altas: Cuotas superiores a 3.00
+
+```{r tablaCuotaMod6, results='asis'}
+datos_apuesta_6 <- datos_apuesta_6 %>%
+  mutate(Cuota_Predicha = case_when(
+    Resultado_Predicho == "Victoria Local" ~ Cuota_Victoria_Local,
+    Resultado_Predicho == "Empate" ~ Cuota_Empate,
+    Resultado_Predicho == "Victoria Visitante" ~ Cuota_Victoria_Visitante,
+    TRUE ~ NA_real_
+  ),
+  Rango_Cuota = cut(
+    Cuota_Predicha,
+    breaks = c(0, 1.5, 2, 3, Inf),
+    labels = c("Bajas", "Medias", "Altas", "Muy Altas"),
+    right = FALSE
+  ))
+
+resumen_cuotas <- datos_apuesta_6 %>%
+  group_by(Modelo, Rango_Cuota) %>%
+  summarise(
+    Apuestas = n(),
+    Ganancia = sum(Ganancia, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(Rango_Cuota) %>%
+  summarise(
+    Apuestas_Medias = mean(Apuestas),
+    Ganancia_Media = mean(Ganancia),
+    ROI_Medio = Ganancia_Media / Apuestas_Medias,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(ROI_Medio))
+
+resumen_cuotas %>%
+  kable(format = "latex", caption = "Ganancias por rango de cuotas (Modelo 5)", booktabs = TRUE, row.names = FALSE, align = "c", digits = 2) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down", "condensed"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+```{r grafCuotaMod6, fig.cap="Ganancias por rango de cuotas (Modelo 6)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+ggplot(resumen_cuotas, aes(x = Rango_Cuota, y = ROI_Medio, fill = Rango_Cuota)) +
+  geom_bar(stat = "identity") +
+  labs(title = "ROI Medio por Rango de Cuota", x = "Rango de Cuota", y = "ROI Medio") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Se cumple también que todos los rangos de apuesta producen beneficios. Se sitúa a la cabeza las apuestas a cuotas muy altas (mayores a 3€), desencadenando un retorno neto medio del 16%. Es por ello que las apuestas a este tipo de cuotas pueden considerarse una gran oportunidad de mercado.
+
+A continuación, analizamos el desempeño de cada equipo por separado, según jueguen como local o como visitante. Cabe destacar que cada equipo juega 19 partidos como local y otros 19 como visitante a lo largo del campeonato.
+
+```{r}
+datos_apuesta_6$EquipoLocal <- rep(datos23_24$EquipoLocal, n_iter)
+datos_apuesta_6$EquipoVisitante <- rep(datos23_24$EquipoVisitante, n_iter)
+
+# Local
+resumen_local <- datos_apuesta_6 %>%
+  group_by(Modelo, EquipoLocal) %>%
+  summarise(
+    Apuestas = n(),
+    Ganancia = sum(Ganancia, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(EquipoLocal) %>%
+  summarise(
+    Apuestas_Medias = mean(Apuestas),
+    Ganancia_Media = mean(Ganancia),
+    ROI_Medio = Ganancia_Media / Apuestas_Medias,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(ROI_Medio))
+
+#print(resumen_local)
+
+# Visitante
+resumen_visitante <- datos_apuesta_6 %>%
+  group_by(Modelo, EquipoVisitante) %>%
+  summarise(
+    Apuestas = n(),
+    Ganancia = sum(Ganancia, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(EquipoVisitante) %>%
+  summarise(
+    Apuestas_Medias = mean(Apuestas),
+    Ganancia_Media = mean(Ganancia),
+    ROI_Medio = Ganancia_Media / Apuestas_Medias,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(ROI_Medio))
+
+#print(resumen_visitante)
+```
+
+```{r grafEquipoLocalMod6, fig.cap="Ganancias por equipo local (Modelo 6)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+ggplot(resumen_local, aes(x = reorder(EquipoLocal, ROI_Medio), y = ROI_Medio, fill = EquipoLocal)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "ROI Medio por Equipo Local", x = "Equipo Local", y = "ROI Medio") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Cuando juegan como local, los equipos que generan un mayor retorno económico son el Celta, el Cádiz y el Almería, obteniéndose una ganancia neta que supera el 40% del dinero total apostado en los 19 partidos que cada uno disputó en casa. Son cifras bastante altas, que mejoran el rendimiento del modelo anterior en lo que se refiere a los equipos en los que se obtienen mayores ganancias. Además, Real Madrid y Atlético de Madrid los siguen con ganancias considerables que rondan el 30%. En el lado negativo se encuentran Sevilla y Girona, los cuales provocan pérdidas de algo mas del 20%.
+
+```{r grafEquipoVisitMod6, fig.cap="Ganancias por equipo visitante (Modelo 6)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+
+ggplot(resumen_visitante, aes(x = reorder(EquipoVisitante, ROI_Medio), y = ROI_Medio, fill = EquipoVisitante)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "ROI Medio por Equipo Visitante", x = "Equipo Visitante", y = "ROI Medio") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Por otro lado, cuando juegan a domicilio, el Sevilla genera un retorno económico de aproximadamente el 50%, una cantidad realmente alta, pero no tanto como la Real Sociedad en el Random Forest. Seguidamente aparecen Mallorca y Real Sociedad, con retornos cerca del 40%. Los peores equipos en cuanto a términos económicos son Villarreal, Celta y Getafe, creando pérdidas alrededor del 20%.
+
+
+
+
+
+

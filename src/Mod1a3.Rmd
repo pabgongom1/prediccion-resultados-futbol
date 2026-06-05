@@ -1,0 +1,1844 @@
+---
+output:
+  pdf_document:
+    keep_tex: true
+    latex_engine: xelatex
+    number_sections: true
+    toc_depth: 3
+    includes:
+      in_header: paqueteplaceins.tex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE)
+```
+
+# Introducción
+
+En este capítulo vamos a ver cómo se aplican en la práctica los modelos estadísticos desarrollados para predecir resultados en el fútbol, utilizando el lenguaje de programación R. Después de haber explicado los conceptos teóricos y metodológicos en los capítulos anteriores, en esta sección se muestra cómo convertir esas ideas en código funcional, aplicándolo a los datos de la liga española de fútbol.
+
+Se detallará el proceso de construcción de los modelos predictivos, tanto para la estimación del número de goles como para la predicción de resultados en formato 1X2. A partir de estos modelos, se llevarán a cabo simulaciones de la temporada 2023/2024 con el fin de generar una predicción de la clasificación final de dicha liga, así como el desarrollo de una estrategia de apuestas basada en los resultados pronosticados.
+
+Este análisis tiene dos vertientes principales:
+
+-   Simulación de la temporada y comparación de las clasificaciones predichas con la tabla de clasificación real de la liga 2023/2024. Esta vertiente se analiza en los modelos que predicen el número de goles, es decir, los basados en Poisson y el random forest de regresión (Modelos 1 a 4).
+-   Estrategia de apuestas, que consiste en apostar una unidad monetaria en cada uno de los partidos de la temporada al resultado predicho por el modelo (formato 1X2). Para evaluar su rentabilidad, se utilizarán las cuotas ofrecidas por la casa de apuestas Bet365, calculando las ganancias o pérdidas obtenidas al final de la temporada. Esta estrategia se aplica utilizando el mejor modelo de Poisson (Modelo 2), así como los modelos 5 y 6, basados en random forest y XGBoost de clasificación, respectivamente.
+
+Todo el trabajo se realiza en el entorno de programación R, el código completo puede consultarse en el anexo.
+
+# Librerías utilizadas
+
+Para la elaboración de este capítulo se ha hecho uso de diversas librerías de R, necesarias para el correcto funcionamiento del código. Entre ellas se encuentran:
+
+-   readr y readxl: utilizadas para la lectura e importación de datos.
+-   kableExtra: empleada para la generación de tablas con formato profesional.
+-   dplyr: fundamental para la manipulación y transformación de datos.
+-   ggplot2: usada para generar gráficos presentables.
+-   caret: para el entrenamiento y validación de los modelos de aprendizaje automático.
+-   randomForest y xgboost: son las encargadas de desarrollar los modelos basados en Random Forest y XGBoost.
+
+```{r}
+library(kableExtra)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(Rcpp)
+library(readxl)
+library(purrr)
+library(lubridate)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(patchwork)
+```
+
+# Depuración de los datos
+
+A partir de los conjuntos de datos ya descritos en el Capítulo 3, en esta sección se lleva a cabo la preparación y limpieza preliminar del primer conjunto antes del desarrollo y evaluación de los modelos. En primer lugar, se cargan y transforman los datos históricos de La Liga correspondientes a las temporadas 2018/2019 a 2022/2023, unificándolos en un único conjunto donde cada fila representa un partido, incluyendo variables clave como los goles del equipo local y visitante, y el resultado final.
+
+Paralelamente, se procesan los datos de la temporada 2023/2024, que contienen las mismas variables mencionadas, además de las cuotas de apuesta ofrecidas por Bet365 para cada posible resultado (1X2). Este último conjunto será utilizado para evaluar tanto las predicciones realizadas como las estrategias de apuesta desarrolladas por los modelos.
+
+Los conjuntos de datos 2 y 3, utilizados en los modelos de bosques aleatorios y XGBoost, serán limpiados y transformados en las secciones correspondientes a cada uno de dichos modelos, respectivamente.
+
+Finalmente, se ha definido una función auxiliar *simular_apuesta* que permite calcular la ganancia neta obtenida en función de las predicciones del modelo y las cuotas reales ofrecidas. Dicha función será utilizada en una etapa posterior del análisis.
+
+Todos los pasos anteriores están implementados en los primeros bloques del código, el cual puede consultarse en el anexo.
+
+```{r}
+#library(kableExtra)
+#library(dplyr)
+datos23_24 <- read.csv("C:/Users/pablo/OneDrive/Escritorio/UNIVERSIDAD 24-25/TFG/R/LaLiga23-24.csv")
+datos23_24 <- datos23_24 %>%
+  select(Date, HomeTeam, AwayTeam, FTHG, FTAG)
+
+datos23_24$Date <- as.Date(datos23_24$Date, format = "%d/%m/%Y")
+datos23_24$HomeTeam <- as.factor(datos23_24$HomeTeam)
+datos23_24$AwayTeam <- as.factor(datos23_24$AwayTeam)
+datos23_24$FTHG <- as.numeric(datos23_24$FTHG)
+datos23_24$FTAG <- as.numeric(datos23_24$FTAG)
+
+datos23_24$Resultado <- factor(ifelse(datos23_24$FTHG > datos23_24$FTAG, "Victoria Local", 
+                          ifelse(datos23_24$FTHG < datos23_24$FTAG, "Victoria Visitante", "Empate")))
+colnames(datos23_24) <- c("Fecha", "EquipoLocal", "EquipoVisitante", "GolesLocal", "GolesVisitante", "Resultado")
+
+# Sabemos que hay 6 partidos aplazados que nos darán problemas luego, por lo que cambiamos la verdadera fecha de esos partidos a una fecha en la que se jugó la jornada correspondiente.
+partidos_aplazados <- data.frame(
+  EquipoLocal = c("Ath Madrid", "Mallorca", "Barcelona", "Ath Madrid", "Getafe", "Granada"),
+  EquipoVisitante = c("Sevilla", "Cadiz", "Osasuna", "Vallecano", "Real Madrid", "Valencia"),
+  JornadaReal = c(4, 13, 20, 20, 20, 26),
+  FechaFicticia = as.Date(c("2023-09-03", "2023-11-12", "2024-01-14", "2024-01-14", "2024-01-14", "2024-02-26"))
+)
+
+# Modificamos las fechas de esos partidos
+for (i in 1:nrow(partidos_aplazados)) {
+  idx <- which(datos23_24$EquipoLocal == partidos_aplazados$EquipoLocal[i] &
+               datos23_24$EquipoVisitante == partidos_aplazados$EquipoVisitante[i])
+  if (length(idx) == 1) {
+    datos23_24$Fecha[idx] <- partidos_aplazados$FechaFicticia[i]
+  }
+}
+
+datos23_24 <- datos23_24 %>%
+  arrange(Fecha) %>%
+  mutate(Jornada = rep(1:38, each = 10)) %>%
+  relocate(Jornada, .after = Fecha)
+```
+
+```{r}
+#library(dplyr)
+#library(readr)  
+
+directorio <- "C:/Users/pablo/OneDrive/Escritorio/UNIVERSIDAD 24-25/TFG/R/"
+archivos <- list.files(directorio, pattern = "LaLiga.*\\.csv", full.names = TRUE)
+# Excluimos el archivo de la temporada 23-24
+archivos <- archivos[!grepl("LaLiga23-24.csv", archivos)]
+
+cargar_datos <- function(archivo) {
+  df <- read_csv(archivo, show_col_types = FALSE) %>%
+    select(Date, HomeTeam, AwayTeam, FTHG, FTAG)  
+  
+  df$Date <- as.Date(df$Date, format = "%d/%m/%Y")  
+  df$HomeTeam <- as.factor(df$HomeTeam)  
+  df$AwayTeam <- as.factor(df$AwayTeam)
+  df$FTHG <- as.numeric(df$FTHG)  
+  df$FTAG <- as.numeric(df$FTAG)  
+  
+  return(df)
+}
+
+datos <- bind_rows(lapply(archivos, cargar_datos));
+
+# Añado una columna que indique el resultado del partido
+datos$Resultado <- ifelse(datos$FTHG > datos$FTAG, "Victoria Local", 
+                          ifelse(datos$FTHG < datos$FTAG, "Victoria Visitante", "Empate"))
+datos$Resultado <- as.factor(datos$Resultado)
+colnames(datos) <- c("Fecha", "EquipoLocal", "EquipoVisitante", "GolesLocal", "GolesVisitante", "Resultado")
+```
+
+```{r}
+#library(kableExtra)
+#library(dplyr)
+cuotas_23_24 <- read.csv("C:/Users/pablo/OneDrive/Escritorio/UNIVERSIDAD 24-25/TFG/R/LaLiga23-24.csv")
+
+cuotas_23_24 <- cuotas_23_24 %>%
+  select(Date, HomeTeam, AwayTeam, FTHG, FTAG, B365H, B365D, B365A)
+
+cuotas_23_24$Date <- as.Date(cuotas_23_24$Date, format = "%d/%m/%Y")
+cuotas_23_24$HomeTeam <- as.factor(cuotas_23_24$HomeTeam)
+cuotas_23_24$AwayTeam <- as.factor(cuotas_23_24$AwayTeam)
+cuotas_23_24$FTHG <- as.numeric(cuotas_23_24$FTHG)
+cuotas_23_24$FTAG <- as.numeric(cuotas_23_24$FTAG)
+
+# Añado una columna que indique el resultado del partido
+cuotas_23_24$Resultado <- factor(ifelse(cuotas_23_24$FTHG > cuotas_23_24$FTAG, "Victoria Local", 
+                          ifelse(cuotas_23_24$FTHG < cuotas_23_24$FTAG, "Victoria Visitante", "Empate")))
+
+colnames(cuotas_23_24) <- c("Fecha", "EquipoLocal", "EquipoVisitante", "GolesLocal", "GolesVisitante", "Cuota_Victoria_Local", "Cuota_Empate", "Cuota_Victoria_Visitante", "Resultado")
+
+# Sabemos que hay 6 partidos aplazados que nos darán problemas luego, por lo que cambiamos la verdadera fecha de esos partidos a una fecha en la que se jugó la jornada correspondiente.
+partidos_aplazados <- data.frame(
+  EquipoLocal = c("Ath Madrid", "Mallorca", "Barcelona", "Ath Madrid", "Getafe", "Granada"),
+  EquipoVisitante = c("Sevilla", "Cadiz", "Osasuna", "Vallecano", "Real Madrid", "Valencia"),
+  JornadaReal = c(4, 13, 20, 20, 20, 26),
+  FechaFicticia = as.Date(c("2023-09-03", "2023-11-12", "2024-01-14", "2024-01-14", "2024-01-14", "2024-02-26"))
+)
+
+# Modificamos las fechas de esos partidos
+for (i in 1:nrow(partidos_aplazados)) {
+  idx <- which(cuotas_23_24$EquipoLocal == partidos_aplazados$EquipoLocal[i] &
+               cuotas_23_24$EquipoVisitante == partidos_aplazados$EquipoVisitante[i])
+  if (length(idx) == 1) {
+    cuotas_23_24$Fecha[idx] <- partidos_aplazados$FechaFicticia[i]
+  }
+}
+
+cuotas_23_24 <- cuotas_23_24 %>%
+  arrange(Fecha) %>%
+  mutate(PartidoID = 1:380) %>%
+  select(PartidoID, Resultado, Cuota_Victoria_Local, Cuota_Empate, Cuota_Victoria_Visitante)
+```
+
+```{r}
+simular_apuesta <- function(prediccion, resultado_real, cuota_local, cuota_empate, cuota_visitante) {
+  if (is.na(prediccion) || is.na(resultado_real)) {
+    return(NA)  
+  }
+  
+  if (prediccion == resultado_real) {
+    # Apuesta ganada
+    if (prediccion == "Victoria Local") {
+      return(cuota_local - 1)  # Ganancia neta
+    } else if (prediccion == "Empate") {
+      return(cuota_empate - 1)
+    } else if (prediccion == "Victoria Visitante") {
+      return(cuota_visitante - 1)
+    } else {
+      return(NA)  
+    }
+  } else {
+    # Apuesta perdida 
+    return(-1)  
+  }
+}
+```
+
+# Modelo 1: Poisson con independencia
+
+A partir del modelo basado en dos distribuciones de Poisson independientes, descrito anteriormente en el capítulo 4 (sección 4.1), se procede a estimar los parámetros del modelo. Dichos parámetros dependen de las habilidades ofensivas y defensivas de los equipos. La estimación de estos parámetros se realiza de forma dinámica, jornada a jornada, utilizando toda la información disponible hasta la jornada inmediatamente anterior de la temporada 2023/2024, junto con los datos históricos desde la temporada 2018/2019.
+
+Este procedimiento permite adaptar los parámetros del modelo a la evolución real de la temporada, ajustando las habilidades ofensivas ($\alpha$) y defensivas ($\beta$) de cada equipo en función del rendimiento observado. En la siguiente tabla se muestra, a modo ilustrativo, un resumen de las habilidades estimadas para la primera jornada:
+
+```{r TablaHabilidadesMod1, results='asis'}
+#library(dplyr)
+
+equipos <- unique(c(datos$EquipoLocal, datos$EquipoVisitante, datos23_24$EquipoLocal, datos23_24$EquipoVisitante))
+n_equipos <- length(equipos)
+
+resultados_jornadas <- list()
+
+log_verosimilitud <- function(params, X_ij, Y_ij, equipos_idx_local, equipos_idx_visitante) {
+  alpha <- params[1:n_equipos]
+  beta <- params[(n_equipos + 1):(2 * n_equipos)]
+  gamma <- params[length(params)]
+  
+  logL <- 0
+  for (i in 1:length(X_ij)) {
+    goles_local <- X_ij[i]
+    goles_visitante <- Y_ij[i]
+    
+    logL <- logL + goles_local * log(alpha[equipos_idx_local[i]] * beta[equipos_idx_visitante[i]] * gamma + 1e-10) -
+      (alpha[equipos_idx_local[i]] * beta[equipos_idx_visitante[i]] * gamma) +
+      goles_visitante * log(alpha[equipos_idx_visitante[i]] * beta[equipos_idx_local[i]] + 1e-10) -
+      (alpha[equipos_idx_visitante[i]] * beta[equipos_idx_local[i]])
+  }
+  
+  return(-logL)
+}
+
+# ---- Jornada 1 ----
+partidos_hasta_j1 <- datos  # Solo temporadas 18–23
+
+X_ij <- partidos_hasta_j1$GolesLocal
+Y_ij <- partidos_hasta_j1$GolesVisitante
+equipos_idx_local <- match(partidos_hasta_j1$EquipoLocal, equipos)
+equipos_idx_visitante <- match(partidos_hasta_j1$EquipoVisitante, equipos)
+
+params_iniciales <- c(rep(1, n_equipos), rep(1, n_equipos), 1)
+
+suppressWarnings(
+  optim_result <- optim(params_iniciales, log_verosimilitud,
+                        X_ij = X_ij,
+                        Y_ij = Y_ij,
+                        equipos_idx_local = equipos_idx_local,
+                        equipos_idx_visitante = equipos_idx_visitante,
+                        method = "BFGS",
+                        control = list(maxit = 1000, reltol = 1e-8))
+)
+
+params_optim <- optim_result$par
+alpha_optim <- params_optim[1:n_equipos]
+beta_optim <- params_optim[(n_equipos + 1):(2 * n_equipos)]
+gamma_optim <- params_optim[length(params_optim)]
+
+# Las Palmas no aparece en el histórico, le damos valores medios de Granada y Alavés
+idx_lp <- which(equipos == "Las Palmas")
+idx_granada <- which(equipos == "Granada")
+idx_alaves <- which(equipos == "Alaves")
+
+alpha_optim[idx_lp] <- mean(c(alpha_optim[idx_granada], alpha_optim[idx_alaves]))
+beta_optim[idx_lp] <- mean(c(beta_optim[idx_granada], beta_optim[idx_alaves]))
+
+habilidades_j1 <- data.frame(
+  Jornada = 1,
+  Equipo = equipos,
+  Alpha_Ofensiva = alpha_optim,
+  Beta_Defensiva = beta_optim,
+  Ventaja_Casa = gamma_optim
+)
+
+resultados_jornadas[[1]] <- habilidades_j1
+
+# ---- Resto de jornadas (2 en adelante) ----
+for (j in 2:max(datos23_24$Jornada)) {
+  
+  #cat("Estimando jornada", j, "...\n") 
+  
+  # Partidos hasta jornada j-1 (históricos + temporada 23/24)
+  partidos_hasta_j <- bind_rows(
+    datos,
+    datos23_24 %>% filter(Jornada < j)
+  )
+  
+  X_ij <- partidos_hasta_j$GolesLocal
+  Y_ij <- partidos_hasta_j$GolesVisitante
+  equipos_idx_local <- match(partidos_hasta_j$EquipoLocal, equipos)
+  equipos_idx_visitante <- match(partidos_hasta_j$EquipoVisitante, equipos)
+  
+  # Usamos los parámetros estimados en la jornada anterior como punto de partida
+  params_iniciales <- c(alpha_optim, beta_optim, gamma_optim)
+  
+  suppressWarnings(
+    optim_result <- optim(params_iniciales, log_verosimilitud,
+                          X_ij = X_ij,
+                          Y_ij = Y_ij,
+                          equipos_idx_local = equipos_idx_local,
+                          equipos_idx_visitante = equipos_idx_visitante,
+                          method = "BFGS",
+                          control = list(maxit = 1000, reltol = 1e-8))
+  )
+  
+  params_optim <- optim_result$par
+  alpha_optim <- params_optim[1:n_equipos]
+  beta_optim <- params_optim[(n_equipos + 1):(2 * n_equipos)]
+  gamma_optim <- params_optim[length(params_optim)]
+  
+  habilidades_j <- data.frame(
+    Jornada = j,
+    Equipo = equipos,
+    Alpha_Ofensiva = alpha_optim,
+    Beta_Defensiva = beta_optim,
+    Ventaja_Casa = gamma_optim
+  )
+  
+  resultados_jornadas[[j]] <- habilidades_j
+}
+
+habilidades_por_jornada <- bind_rows(resultados_jornadas)
+
+habilidades_por_jornada_simbolos <- habilidades_por_jornada
+colnames(habilidades_por_jornada_simbolos) <- c("Jornada", "Equipo", "$\\alpha$", "$\\beta$", "$\\gamma$")
+
+kable(head(habilidades_por_jornada_simbolos, 10), format = "latex", caption = "Habilidades estimadas Jornada 1 (Modelo 1)", booktabs = TRUE, row.names = FALSE, escape = FALSE, align = "c", digits = 3) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+A continuación, se representa la evolución de la habilidad ofensiva y defensiva estimada a lo largo de las jornadas para cinco equipos seleccionados: Real Madrid, Barcelona, Atlético de Madrid, Betis y Granada. Estas gráficas permiten visualizar cómo varían las fortalezas de ataque y defensa de cada equipo durante la temporada.
+
+```{r grafHabOfensivaMod1, fig.cap="Evolución de la habilidad ofensiva (Modelo 1)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+#library(ggplot2)
+
+equipos_grafico <- c("Real Madrid", "Barcelona", "Ath Madrid", "Betis", "Granada")
+
+df_grafico <- habilidades_por_jornada %>%
+  filter(Equipo %in% equipos_grafico)
+
+# Gráfico de evolución ofensiva
+ggplot(df_grafico, aes(x = Jornada, y = Alpha_Ofensiva, color = Equipo)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 1) +
+  labs(title = "Evolución de la Habilidad Ofensiva",
+       x = "Jornada",
+       y = expression(alpha)) +
+  theme_minimal() +
+  theme(legend.position = "top", plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+```{r grafHabDefensivaMod1, fig.cap="Evolución de la habilidad defensiva (Modelo 1)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+# Gráfico de evolución defensiva
+ggplot(df_grafico, aes(x = Jornada, y = Beta_Defensiva, color = Equipo)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 1) +
+  labs(title = "Evolución de la Habilidad Defensiva",
+       x = "Jornada",
+       y = expression(beta)) +
+  theme_minimal() +
+  theme(legend.position = "top", plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Se aprecia claramente que los mejores equipos (Real Madrid, FC Barcelona, Atlético de Madrid) destacan tanto por sus habilidades ofensivas, reflejadas en valores más altos del parámetro $\alpha$, como por su destreza defensiva, representada por valores más bajos de $\beta$. Por otro lado, no se ven grandes variaciones en los parámetros de cada equipo a lo largo de la temporada, lo cual contrasta con los siguientes modelos, en los que se incorpora una función de ponderación temporal que otorga mayor relevancia a los partidos más recientes.
+
+Visualizamos ahora la evolución del parámetro $\gamma$, que representa la ventaja de jugar como local. Se observa que dicho valor se mantiene prácticamente constante (alrededor de 1,30) a lo largo de las jornadas, lo cual era esperable dada la naturaleza del parámetro.
+
+```{r grafVentajaCasaMod1, fig.cap="Ventaja de jugar en casa (Modelo 1)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+ventaja_evolucion <- habilidades_por_jornada %>%
+  group_by(Jornada) %>%
+  summarise(Ventaja_Casa = mean(Ventaja_Casa)) 
+
+# Gráfico de evolución de la ventaja de jugar en casa
+ggplot(ventaja_evolucion, aes(x = Jornada, y = Ventaja_Casa)) +
+  geom_line(color = "darkred", size = 1.2) +
+  geom_point(color = "darkred", size = 1) +
+  labs(title = "Evolución de la Ventaja de Jugar en Casa",
+       x = "Jornada",
+       y = expression(gamma)) +
+  scale_y_continuous(limits = c(1.2, 1.4)) +
+  theme_minimal() +
+  theme(legend.position = "top", plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+A partir de las habilidades ofensivas y defensivas estimadas previamente, se procede a realizar 1000 simulaciones de la temporada 2023/2024 de la Primera División Española. Así, para cada equipo se calcula tanto la media de puntos obtenidos a lo largo de todas las simulaciones, como la probabilidad de terminar en diferentes rangos de la tabla de clasificación: proclamarse campeón de liga, clasificarse para la *UEFA Champions League* (quedar entre la primera y la cuarta posición), clasificarse para *UEFA Europa League* (quedar 5º o 6º), clasificarse para la *UEFA Conference League* (quedar séptimo), mantenerse en la zona media (entre el octavo y el décimo séptimo puesto), o caer en puestos de descenso, que consiste en terminar entre los tres últimos clasificados.
+
+```{r ClasificacionMod1, results='asis'}
+set.seed(10)
+n_simulaciones <- 1000
+
+equipos <- unique(c(datos23_24$EquipoLocal, datos23_24$EquipoVisitante))
+n_equipos <- length(equipos)
+jornadas <- sort(unique(datos23_24$Jornada))
+
+resultados_sim <- matrix(0, nrow = n_equipos, ncol = n_simulaciones)
+puntos_sim <- matrix(0, nrow = n_equipos, ncol = n_simulaciones)
+
+for (sim in 1:n_simulaciones) {
+  #if (sim %% 100 == 0) cat("Simulación", sim, "de", n_simulaciones, "\n")
+  
+  clasificacion <- data.frame(
+    Equipo = equipos, Puntos = 0, PJ = 0, PG = 0, PE = 0, PP = 0, GF = 0, GC = 0, stringsAsFactors = FALSE
+  )
+  
+  for (j in jornadas) {
+    partidos_jornada <- datos23_24 %>% filter(Jornada == j)
+    habilidades_j <- habilidades_por_jornada %>% filter(Jornada == j)
+    
+    idx_local <- match(partidos_jornada$EquipoLocal, habilidades_j$Equipo)
+    idx_visit <- match(partidos_jornada$EquipoVisitante, habilidades_j$Equipo)
+    
+    alpha_local <- habilidades_j$Alpha_Ofensiva[idx_local]
+    beta_visit <- habilidades_j$Beta_Defensiva[idx_visit]
+    alpha_visit <- habilidades_j$Alpha_Ofensiva[idx_visit]
+    beta_local <- habilidades_j$Beta_Defensiva[idx_local]
+    gamma <- habilidades_j$Ventaja_Casa[1]  
+
+    lambda_local <- alpha_local * beta_visit * gamma
+    lambda_visit <- alpha_visit * beta_local
+    
+    goles_local <- rpois(length(lambda_local), lambda_local)
+    goles_visit <- rpois(length(lambda_visit), lambda_visit)
+    
+    for (i in 1:nrow(partidos_jornada)) {
+      equipo_local <- partidos_jornada$EquipoLocal[i]
+      equipo_visit <- partidos_jornada$EquipoVisitante[i]
+      g_local <- goles_local[i]
+      g_visit <- goles_visit[i]
+      
+      idx_l <- match(equipo_local, equipos)
+      idx_v <- match(equipo_visit, equipos)
+      
+      clasificacion$PJ[idx_l] <- clasificacion$PJ[idx_l] + 1
+      clasificacion$PJ[idx_v] <- clasificacion$PJ[idx_v] + 1
+      clasificacion$GF[idx_l] <- clasificacion$GF[idx_l] + g_local
+      clasificacion$GF[idx_v] <- clasificacion$GF[idx_v] + g_visit
+      clasificacion$GC[idx_l] <- clasificacion$GC[idx_l] + g_visit
+      clasificacion$GC[idx_v] <- clasificacion$GC[idx_v] + g_local
+      
+      if (g_local > g_visit) {
+        clasificacion$Puntos[idx_l] <- clasificacion$Puntos[idx_l] + 3
+        clasificacion$PG[idx_l] <- clasificacion$PG[idx_l] + 1
+        clasificacion$PP[idx_v] <- clasificacion$PP[idx_v] + 1
+      } else if (g_local < g_visit) {
+        clasificacion$Puntos[idx_v] <- clasificacion$Puntos[idx_v] + 3
+        clasificacion$PG[idx_v] <- clasificacion$PG[idx_v] + 1
+        clasificacion$PP[idx_l] <- clasificacion$PP[idx_l] + 1
+      } else {
+        clasificacion$Puntos[idx_l] <- clasificacion$Puntos[idx_l] + 1
+        clasificacion$Puntos[idx_v] <- clasificacion$Puntos[idx_v] + 1
+        clasificacion$PE[idx_l] <- clasificacion$PE[idx_l] + 1
+        clasificacion$PE[idx_v] <- clasificacion$PE[idx_v] + 1
+      }
+    }
+  }
+  
+  clasificacion <- clasificacion[order(-clasificacion$Puntos, -(clasificacion$GF - clasificacion$GC)), ]
+  
+  resultados_sim[, sim] <- order(match(clasificacion$Equipo, equipos))
+  puntos_sim[, sim] <- clasificacion$Puntos[match(equipos, clasificacion$Equipo)]
+}
+
+predMod1 <- data.frame(
+  Equipo = equipos,
+  Media_Puntos = rowMeans(puntos_sim),
+  Prob_Campeon = rowMeans(resultados_sim == 1) * 100,
+  Prob_UCL = rowMeans(resultados_sim <= 4) * 100,
+  Prob_UEL = rowMeans(resultados_sim >= 5 & resultados_sim <= 6) * 100,
+  Prob_UECL = rowMeans(resultados_sim == 7) * 100,
+  Prob_Mitad_Tabla = rowMeans(resultados_sim >= 8 & resultados_sim <= 17) * 100,
+  Prob_Descenso = rowMeans(resultados_sim >= 18) * 100
+)
+
+predMod1 <- predMod1[order(-predMod1$Media_Puntos), ]
+predMod1$Posicion <- 1:nrow(predMod1)
+predMod1 <- predMod1[, c("Posicion", "Equipo", "Media_Puntos", "Prob_Campeon", "Prob_UCL", "Prob_UEL", "Prob_UECL", "Prob_Mitad_Tabla", "Prob_Descenso")]
+
+kable(predMod1, format = "latex", 
+      caption = "Probabilidades de clasificación (Modelo 1)", 
+      booktabs = TRUE, row.names = FALSE, escape = TRUE, align = "c") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Los resultados de la simulación reflejan una clara tendencia: los equipos con mejor rendimiento en las anteriores temporadas y con mejor plantilla, como el Real Madrid, el FC Barcelona o el Atlético de Madrid, concentran las mayores probabilidades de hacerse con el título y de asegurar plaza en UCL. Por otro lado, los clubes recién ascendidos o con un rendimiento relativamente bajo en las últimas temporadas, como el Alavés o el Cádiz, presentan una mayor probabilidad de finalizar la temporada en puestos de descenso. Esta tabla ofrece una visión general del rendimiento esperado de cada equipo bajo el Modelo 1, donde se percibe una clasificación que puede considerarse realista.
+
+Seguidamente se procederá a compararla con la clasificación final real de la temporada 2023/2024. Para ello, veamos antes la tabla oficial:
+
+```{r clasificacion24-25, results='asis'}
+clasificacion_real <- data.frame(
+  Equipo = unique(c(datos23_24$EquipoLocal, datos23_24$EquipoVisitante)),
+  Puntos_Real = 0,
+  PJ = 0,
+  PG = 0,
+  PE = 0,
+  PP = 0,
+  GF = 0,
+  GC = 0,
+  stringsAsFactors = FALSE
+)
+
+for (i in 1:nrow(datos23_24)) {
+  equipo_local <- datos23_24$EquipoLocal[i]
+  equipo_visitante <- datos23_24$EquipoVisitante[i]
+  goles_local <- datos23_24$GolesLocal[i]
+  goles_visitante <- datos23_24$GolesVisitante[i]
+
+  idx_local <- match(equipo_local, clasificacion_real$Equipo)
+  idx_visitante <- match(equipo_visitante, clasificacion_real$Equipo)
+
+  clasificacion_real$PJ[idx_local] <- clasificacion_real$PJ[idx_local] + 1
+  clasificacion_real$PJ[idx_visitante] <- clasificacion_real$PJ[idx_visitante] + 1
+
+  clasificacion_real$GF[idx_local] <- clasificacion_real$GF[idx_local] + goles_local
+  clasificacion_real$GF[idx_visitante] <- clasificacion_real$GF[idx_visitante] + goles_visitante
+  clasificacion_real$GC[idx_local] <- clasificacion_real$GC[idx_local] + goles_visitante
+  clasificacion_real$GC[idx_visitante] <- clasificacion_real$GC[idx_visitante] + goles_local
+
+  if (goles_local > goles_visitante) {
+    clasificacion_real$Puntos_Real[idx_local] <- clasificacion_real$Puntos_Real[idx_local] + 3
+    clasificacion_real$PG[idx_local] <- clasificacion_real$PG[idx_local] + 1
+    clasificacion_real$PP[idx_visitante] <- clasificacion_real$PP[idx_visitante] + 1
+  } else if (goles_local < goles_visitante) {
+    clasificacion_real$Puntos_Real[idx_visitante] <- clasificacion_real$Puntos_Real[idx_visitante] + 3
+    clasificacion_real$PG[idx_visitante] <- clasificacion_real$PG[idx_visitante] + 1
+    clasificacion_real$PP[idx_local] <- clasificacion_real$PP[idx_local] + 1
+  } else {
+    clasificacion_real$Puntos_Real[idx_local] <- clasificacion_real$Puntos_Real[idx_local] + 1
+    clasificacion_real$Puntos_Real[idx_visitante] <- clasificacion_real$Puntos_Real[idx_visitante] + 1
+    clasificacion_real$PE[idx_local] <- clasificacion_real$PE[idx_local] + 1
+    clasificacion_real$PE[idx_visitante] <- clasificacion_real$PE[idx_visitante] + 1
+  }
+}
+
+clasificacion_real <- clasificacion_real[order(-clasificacion_real$Puntos_Real, -(clasificacion_real$GF - clasificacion_real$GC)), ]
+
+clasificacion_real[c(13, 14), ] <- clasificacion_real[c(14, 13), ]
+
+clasificacion_real$Posicion_Real <- 1:nrow(clasificacion_real)
+clasificacion_real<- clasificacion_real %>% select(last_col(), everything())
+
+kable(clasificacion_real, format = "latex", 
+      caption = "Clasificación real de La Liga 2023/2024", 
+      booktabs = TRUE, row.names = FALSE, escape = TRUE, align = "c") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+## Comparación de Posiciones
+
+Para evaluar la precisión del modelo, se compara la clasificación media predicha con la clasificación real al final de la temporada 2023/2024. En primer lugar, calculamos el error absoluto medio en las posiciones de los equipos y mostramos una tabla con los errores individuales. Finalmente, visualizamos gráficamente la relación entre las posiciones reales y las simuladas para analizar las desviaciones.
+
+```{r}
+comparacion <- merge(predMod1, clasificacion_real[, c("Equipo", "Posicion_Real")], by = "Equipo")
+error_posicion <- abs(comparacion$Posicion - comparacion$Posicion_Real)
+error_medio_posicion <- mean(error_posicion)
+#cat("Error medio de posiciones:", error_medio_posicion, "\n")
+```
+
+```{r tablaComparacionPosicionesMod1, results='asis'}
+#library(dplyr)
+comparacion_posiciones <- predMod1 %>%
+  select(Equipo, Posicion) %>% 
+  rename(Posicion_Predicha = Posicion) %>%
+  left_join(clasificacion_real %>% select(Equipo, Posicion_Real), by = "Equipo") %>%
+  mutate(Error_Posicion = abs(Posicion_Predicha - Posicion_Real)) %>%
+  arrange(Posicion_Predicha)  
+
+comparacion_posiciones %>%
+  kable(format = "latex", caption = "Comparación de Posiciones: Predichas vs Reales (Modelo 1)", booktabs = TRUE, row.names = FALSE, align = "c") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down", "condensed"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+```{r results='asis'}
+cat("El error absoluto medio entre las posiciones predichas y reales es:", round(error_medio_posicion, 2), "\n")
+```
+
+En la mayoría de equipos, la predicción de la posición se acerca bastante a lo que ocurrió realmente, distando entre cero y tres posiciones, lo que indica que el modelo funciona medianamente bien. No obstante, existen grandes errores en clubes como el Sevilla, el cual hizo una muy mala campaña en comparación con lo que venía haciendo en las temporadas anteriores, quedando en el puesto 14, muy lejos de la zona europea donde llevaba varios años acabando. En el extremo opuesto se encuentra el Alavés, para el que el modelo ha predicho la última posición, pero sorprendentemente el conjunto vasco acabó haciendo una gran temporada y consiguiendo el décimo puesto, un exitoso logro para uno de los clubes con el presupuesto más bajo de primera dicisión. Cabe destacar también la tercera posición del Girona en la mejor temporada de su historia, por lo que el modelo también obtuvo un error relevante de 5 posiciones para dicho equipo.
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Esto indica que, en promedio, la predicción del puesto en la tabla clasificatoria de cada equipo se desvía en 2,7 posiciones del puesto real. Es un valor decente pero podría mejorarse.
+
+```{r graficoComparacionPosicionesMod1, fig.cap="Comparación de posiciones Predichas vs Reales (Modelo 1)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+#library(ggplot2)
+ggplot(comparacion, aes(x = Posicion_Real, y = Posicion, label = Equipo)) +
+  geom_point(color = "blue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  geom_text(vjust = -0.5, size = 3) +
+  labs(title = "Comparación de posiciones: Predichas vs Reales",
+       x = "Posición Real",
+       y = "Posición Predicha") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+En el gráfico se visualiza que la mayoría de los puntos se alinean cerca de la diagonal, lo que refleja una buena correspondencia entre las posiciones predichas y las reales. Sin embargo, existen algunos equipos como Alavés, Sevilla, Girona o Granada, en los que se cometen errores importantes en la predicción de su posición final.
+
+## Comparación de Puntos
+
+Pasamos a hacer el mismo estudio con la predicción de los puntos. En este caso, al ser una variable mucho más dispersa, el error cometido será mayor.
+
+```{r}
+#library(dplyr)
+#library(ggplot2)
+
+comparacion_puntos <- predMod1 %>%
+  select(Equipo, Media_Puntos) %>%
+  rename(Puntos_Predichos = Media_Puntos) %>%
+  left_join(clasificacion_real %>% select(Equipo, Puntos_Real), by = "Equipo") %>%
+  mutate(Error_Puntos = abs(Puntos_Predichos - Puntos_Real)) %>%
+  arrange(desc(Puntos_Predichos))  
+
+error_medio_puntos <- mean(comparacion_puntos$Error_Puntos)
+#cat("Error medio de puntos:", error_medio_puntos, "\n")
+```
+
+```{r tablaComparacionPuntosMod1, results='asis'}
+comparacion_puntos %>%
+  kable(format = "latex", caption = "Comparación de Puntos: Predichos vs Reales (Modelo 1)", booktabs = TRUE, row.names = FALSE, align = "c") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down", "condensed"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+```{r results='asis'}
+cat("El error absoluto medio entre los puntos predichos y reales es:", round(error_medio_puntos, 2), "\n")
+```
+
+En cuanto a la predicción de puntos, el modelo es altamente penalizado por equipos como el Real Madrid, el cual hizo una de sus mejores puntuaciones en los últimos años, así pues el modelo se quedó por debajo en la predicción cometiendo un error de casi 18 puntos; el Sevilla, cometiendo un error de unos 19 puntos; el Girona, que, como hemos mencionado previamente, hizo la mejor campaña liguera de su historia, y se comete un error de 27 puntos; o el Granada, para el que el modelo ha predicho alrededor de 44 puntos, pero el conjunto andaluz hizo una lamentable temporada, logrando únicamente 21 puntos y acabando en último lugar.
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+```{r graficoComparacionPuntosMod1, fig.cap="Comparación de puntos Predichos vs Reales (Modelo 1)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+ggplot(comparacion_puntos, aes(x = Puntos_Real, y = Puntos_Predichos, label = Equipo)) +
+  geom_point(color = "blue", size = 3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  geom_text(vjust = -0.5, size = 3) +
+  labs(title = "Comparación de Puntos: Predichos vs Reales",
+       x = "Puntos Reales",
+       y = "Puntos Predichos") +
+  coord_fixed() +  
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Gráficamente se aprecia una mayor dispersión que en el gráfico de posiciones. La predicción se acerca bastante en un gran número de equipos, no obstante, se cometen importantes errores en la predicción de puntos de equipos como Granada, Sevilla, Almería, Real Madrid y Girona.
+
+# Modelo 2: Poisson con independencia y ponderación temporal
+
+Como ya se ha expuesto previamente en la segunda sección del capítulo 4, este modelo es esencialmente igual al anterior, con el añadido de una función de ponderación temporal que otorga mayor peso a los partidos más recientes. Esto permitirá que la estimación de habilidades ofensivas y defensivas se adapte más rápidamente a la evolución de los equipos durante la temporada.
+
+A continuación se muestran las habilidades estimadas de 10 equipos para la primera jornada:
+
+```{r TablaHabilidadesMod2, results='asis'}
+# Función de ponderación temporal
+peso_temporal <- function(delta_t, lambda_w) {
+  exp(-lambda_w * delta_t)  # Ponderación exponencial decreciente
+}
+
+#library(dplyr)
+
+equipos <- unique(c(datos$EquipoLocal, datos$EquipoVisitante, datos23_24$EquipoLocal, datos23_24$EquipoVisitante))
+n_equipos <- length(equipos)
+
+resultados_jornadas <- list()
+
+log_verosimilitud <- function(params, X_ij, Y_ij, equipos_idx_local, equipos_idx_visitante, tiempo, lambda_w) {
+  alpha <- params[1:n_equipos]
+  beta <- params[(n_equipos + 1):(2 * n_equipos)]
+  gamma <- params[length(params)]
+  
+  logL <- 0
+  for (i in 1:length(X_ij)) {
+    goles_local <- X_ij[i]
+    goles_visitante <- Y_ij[i]
+    
+    # Parámetros para este partido
+    lambda_k <- alpha[equipos_idx_local[i]] * beta[equipos_idx_visitante[i]] * gamma
+    mu_k <- alpha[equipos_idx_visitante[i]] * beta[equipos_idx_local[i]]
+    
+    peso <- peso_temporal(tiempo[i], lambda_w)
+    
+    logL <- logL + peso * (goles_local * log(lambda_k + 1e-10) - lambda_k +
+      goles_visitante * log(mu_k + 1e-10) - mu_k)
+  }
+  
+  return(-logL)
+}
+
+# ---- Jornada 1 ----
+partidos_hasta_j1 <- datos  
+
+X_ij <- partidos_hasta_j1$GolesLocal
+Y_ij <- partidos_hasta_j1$GolesVisitante
+equipos_idx_local <- match(partidos_hasta_j1$EquipoLocal, equipos)
+equipos_idx_visitante <- match(partidos_hasta_j1$EquipoVisitante, equipos)
+
+# Normalizamos el tiempo en días para la función de ponderación
+fecha_num <- as.numeric(partidos_hasta_j1$Fecha)
+fecha_actual <- max(fecha_num)
+tiempo <- fecha_actual - fecha_num
+
+# Parámetro de ponderación temporal
+lambda_w <- 0.00186
+
+params_iniciales <- c(rep(1, n_equipos), rep(1, n_equipos), 1)
+
+suppressWarnings(
+  optim_result <- optim(params_iniciales, log_verosimilitud,
+                        X_ij = X_ij,
+                        Y_ij = Y_ij,
+                        equipos_idx_local = equipos_idx_local,
+                        equipos_idx_visitante = equipos_idx_visitante,
+                        tiempo = tiempo,
+                        lambda_w = lambda_w,
+                        method = "BFGS",
+                        control = list(maxit = 1000, reltol = 1e-8))
+)
+
+params_optim <- optim_result$par
+alpha_optim <- params_optim[1:n_equipos]
+beta_optim <- params_optim[(n_equipos + 1):(2 * n_equipos)]
+gamma_optim <- params_optim[length(params_optim)]
+
+# Las Palmas no aparece en el histórico, le damos valores medios de Granada y Alavés
+idx_lp <- which(equipos == "Las Palmas")
+idx_granada <- which(equipos == "Granada")
+idx_alaves <- which(equipos == "Alaves")
+
+alpha_optim[idx_lp] <- mean(c(alpha_optim[idx_granada], alpha_optim[idx_alaves]))
+beta_optim[idx_lp] <- mean(c(beta_optim[idx_granada], beta_optim[idx_alaves]))
+
+habilidades_j1 <- data.frame(
+  Jornada = 1,
+  Equipo = equipos,
+  Alpha_Ofensiva = alpha_optim,
+  Beta_Defensiva = beta_optim,
+  Ventaja_Casa = gamma_optim
+)
+
+resultados_jornadas[[1]] <- habilidades_j1
+
+# ---- Resto de jornadas (2 en adelante) ----
+for (j in 2:max(datos23_24$Jornada)) {
+  
+  #cat("Estimando jornada", j, "...\n") 
+  
+  # Partidos hasta jornada j-1 (históricos + temporada 23/24)
+  partidos_hasta_j <- bind_rows(
+    datos,
+    datos23_24 %>% filter(Jornada < j)
+  )
+  
+  #fecha_corte <- max(partidos_hasta_j$Fecha) - 365 * 2  # últimos 2 años
+  #partidos_hasta_j <- partidos_hasta_j %>% filter(Fecha >= fecha_corte)
+
+  X_ij <- partidos_hasta_j$GolesLocal
+  Y_ij <- partidos_hasta_j$GolesVisitante
+  equipos_idx_local <- match(partidos_hasta_j$EquipoLocal, equipos)
+  equipos_idx_visitante <- match(partidos_hasta_j$EquipoVisitante, equipos)
+  
+  fecha_num <- as.numeric(partidos_hasta_j$Fecha)
+  fecha_actual <- max(fecha_num)
+  tiempo <- fecha_actual - fecha_num
+  
+  # Usamos los parámetros estimados en la jornada anterior como punto de partida
+  params_iniciales <- c(alpha_optim, beta_optim, gamma_optim)
+  
+  suppressWarnings(
+    optim_result <- optim(params_iniciales, log_verosimilitud,
+                          X_ij = X_ij,
+                          Y_ij = Y_ij,
+                          equipos_idx_local = equipos_idx_local,
+                          equipos_idx_visitante = equipos_idx_visitante,
+                          tiempo = tiempo,
+                          lambda_w = lambda_w,
+                          method = "BFGS",
+                          control = list(maxit = 1000, reltol = 1e-8))
+  )
+  
+  params_optim <- optim_result$par
+  alpha_optim <- params_optim[1:n_equipos]
+  beta_optim <- params_optim[(n_equipos + 1):(2 * n_equipos)]
+  gamma_optim <- params_optim[length(params_optim)]
+  
+  habilidades_j <- data.frame(
+    Jornada = j,
+    Equipo = equipos,
+    Alpha_Ofensiva = alpha_optim,
+    Beta_Defensiva = beta_optim,
+    Ventaja_Casa = gamma_optim
+  )
+  
+  resultados_jornadas[[j]] <- habilidades_j
+}
+
+habilidades_por_jornada <- bind_rows(resultados_jornadas)
+habilidades_por_jornada_simbolos <- habilidades_por_jornada
+colnames(habilidades_por_jornada_simbolos) <- c("Jornada", "Equipo", "$\\alpha$", "$\\beta$", "$\\gamma$")
+
+kable(head(habilidades_por_jornada_simbolos, 10), format = "latex", caption = "Habilidades estimadas Jornada 1 (Modelo 2)", booktabs = TRUE, row.names = FALSE, escape = FALSE, align = "c", digits = 3) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+De forma similar al modelo anterior, se representa la evolución de la habilidad ofensiva y defensiva estimada a lo largo de las jornadas para los siguientes equipos: Real Madrid, Barcelona, Atlético de Madrid, Betis y Granada.
+
+```{r grafHabOfensivaMod2, fig.cap="Evolución de la habilidad ofensiva (Modelo 2)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+#library(ggplot2)
+equipos_grafico <- c("Real Madrid", "Barcelona", "Ath Madrid", "Betis", "Granada")
+df_grafico <- habilidades_por_jornada %>%
+  filter(Equipo %in% equipos_grafico)
+
+# Gráfico de evolución ofensiva
+ggplot(df_grafico, aes(x = Jornada, y = Alpha_Ofensiva, color = Equipo)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 1) +
+  labs(title = "Evolución de la Habilidad Ofensiva",
+       x = "Jornada",
+       y = expression(alpha)) +
+  theme_minimal() +
+  theme(legend.position = "top", plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+```{r grafHabDefensivaMod2, fig.cap="Evolución de la habilidad defensiva (Modelo 2)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+# Gráfico de evolución defensiva
+ggplot(df_grafico, aes(x = Jornada, y = Beta_Defensiva, color = Equipo)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 1) +
+  labs(title = "Evolución de la Habilidad Defensiva",
+       x = "Jornada",
+       y = expression(beta)) +
+  theme_minimal() +
+  theme(legend.position = "top", plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+En contraste con el modelo anterior, en este caso se observa una mayor variación de los parámetros a lo largo de la temporada, capturando de forma más eficaz las rachas positivas y negativas de los equipos. Un ejemplo claro es el Real Madrid, que se proclamó campeón con solvencia, y en ambos gráficos se detecta como se desmarca claramente de sus rivales en la lucha por el título.
+
+Visualizamos ahora la evolución del parámetro que representa la ventaja de jugar como local. Como era de esperar debido a la naturaleza del parámetro, se mantiene prácticamente constante a lo largo de la temporada, alrededor de 1,32.
+
+```{r grafVentajaCasaMod2, fig.cap="Ventaja de jugar en casa (Modelo 2)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+ventaja_evolucion <- habilidades_por_jornada %>%
+  group_by(Jornada) %>%
+  summarise(Ventaja_Casa = mean(Ventaja_Casa))  
+
+# Gráfico de evolución de la ventaja de jugar en casa
+ggplot(ventaja_evolucion, aes(x = Jornada, y = Ventaja_Casa)) +
+  geom_line(color = "darkred", size = 1.2) +
+  geom_point(color = "darkred", size = 1) +
+  labs(title = "Evolución de la Ventaja de Jugar en Casa",
+       x = "Jornada",
+       y = expression(gamma)) +
+  scale_y_continuous(limits = c(1.2, 1.4)) +
+  theme_minimal() +
+  theme(legend.position = "top", plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+De forma similar al modelo anterior, se efectúan 1000 simulaciones de la temporada 2023/2024 empleando los parámetros estimados, calculando para cada equipo la media de puntos y las probabilidades de acabar en distintos tramos de la clasificación:
+
+```{r ClasificacionMod2, results='asis'}
+set.seed(10)
+n_simulaciones <- 1000
+
+equipos <- unique(c(datos23_24$EquipoLocal, datos23_24$EquipoVisitante))
+n_equipos <- length(equipos)
+jornadas <- sort(unique(datos23_24$Jornada))
+
+resultados_sim <- matrix(0, nrow = n_equipos, ncol = n_simulaciones)
+puntos_sim <- matrix(0, nrow = n_equipos, ncol = n_simulaciones)
+
+for (sim in 1:n_simulaciones) {
+  #if (sim %% 100 == 0) cat("Simulación", sim, "de", n_simulaciones, "\n")
+  
+  if (sim == 1) {
+  n_partidos <- nrow(datos23_24)
+  goles_local_mat <- matrix(NA, nrow = n_partidos, ncol = n_simulaciones)
+  goles_visit_mat <- matrix(NA, nrow = n_partidos, ncol = n_simulaciones)
+  partidos_id <- paste(datos23_24$EquipoLocal, "-", datos23_24$EquipoVisitante)
+  }
+  
+  clasificacion <- data.frame(
+    Equipo = equipos, Puntos = 0, PJ = 0, PG = 0, PE = 0, PP = 0, GF = 0, GC = 0, stringsAsFactors = FALSE
+  )
+  
+  for (j in jornadas) {
+    partidos_jornada <- datos23_24 %>% filter(Jornada == j)
+    habilidades_j <- habilidades_por_jornada %>% filter(Jornada == j)
+    
+    idx_local <- match(partidos_jornada$EquipoLocal, habilidades_j$Equipo)
+    idx_visit <- match(partidos_jornada$EquipoVisitante, habilidades_j$Equipo)
+    
+    alpha_local <- habilidades_j$Alpha_Ofensiva[idx_local]
+    beta_visit <- habilidades_j$Beta_Defensiva[idx_visit]
+    alpha_visit <- habilidades_j$Alpha_Ofensiva[idx_visit]
+    beta_local <- habilidades_j$Beta_Defensiva[idx_local]
+    gamma <- habilidades_j$Ventaja_Casa[1]  # es constante por jornada
+
+    lambda_local <- alpha_local * beta_visit * gamma
+    lambda_visit <- alpha_visit * beta_local
+    
+    goles_local <- rpois(length(lambda_local), lambda_local)
+    goles_visit <- rpois(length(lambda_visit), lambda_visit)
+    
+    idx_partidos <- which(datos23_24$Jornada == j)
+    goles_local_mat[idx_partidos, sim] <- goles_local
+    goles_visit_mat[idx_partidos, sim] <- goles_visit
+    
+    for (i in 1:nrow(partidos_jornada)) {
+      equipo_local <- partidos_jornada$EquipoLocal[i]
+      equipo_visit <- partidos_jornada$EquipoVisitante[i]
+      g_local <- goles_local[i]
+      g_visit <- goles_visit[i]
+      
+      idx_l <- match(equipo_local, equipos)
+      idx_v <- match(equipo_visit, equipos)
+      
+      clasificacion$PJ[idx_l] <- clasificacion$PJ[idx_l] + 1
+      clasificacion$PJ[idx_v] <- clasificacion$PJ[idx_v] + 1
+      clasificacion$GF[idx_l] <- clasificacion$GF[idx_l] + g_local
+      clasificacion$GF[idx_v] <- clasificacion$GF[idx_v] + g_visit
+      clasificacion$GC[idx_l] <- clasificacion$GC[idx_l] + g_visit
+      clasificacion$GC[idx_v] <- clasificacion$GC[idx_v] + g_local
+      
+      # Asignación de puntos
+      if (g_local > g_visit) {
+        clasificacion$Puntos[idx_l] <- clasificacion$Puntos[idx_l] + 3
+        clasificacion$PG[idx_l] <- clasificacion$PG[idx_l] + 1
+        clasificacion$PP[idx_v] <- clasificacion$PP[idx_v] + 1
+      } else if (g_local < g_visit) {
+        clasificacion$Puntos[idx_v] <- clasificacion$Puntos[idx_v] + 3
+        clasificacion$PG[idx_v] <- clasificacion$PG[idx_v] + 1
+        clasificacion$PP[idx_l] <- clasificacion$PP[idx_l] + 1
+      } else {
+        clasificacion$Puntos[idx_l] <- clasificacion$Puntos[idx_l] + 1
+        clasificacion$Puntos[idx_v] <- clasificacion$Puntos[idx_v] + 1
+        clasificacion$PE[idx_l] <- clasificacion$PE[idx_l] + 1
+        clasificacion$PE[idx_v] <- clasificacion$PE[idx_v] + 1
+      }
+    }
+  }
+  
+  clasificacion <- clasificacion[order(-clasificacion$Puntos, -(clasificacion$GF - clasificacion$GC)), ]
+  
+  resultados_sim[, sim] <- order(match(clasificacion$Equipo, equipos))
+  puntos_sim[, sim] <- clasificacion$Puntos[match(equipos, clasificacion$Equipo)]
+}
+
+predMod2 <- data.frame(
+  Equipo = equipos,
+  Media_Puntos = rowMeans(puntos_sim),
+  Prob_Campeon = rowMeans(resultados_sim == 1) * 100,
+  Prob_UCL = rowMeans(resultados_sim <= 4) * 100,
+  Prob_UEL = rowMeans(resultados_sim >= 5 & resultados_sim <= 6) * 100,
+  Prob_UECL = rowMeans(resultados_sim == 7) * 100,
+  Prob_Mitad_Tabla = rowMeans(resultados_sim >= 8 & resultados_sim <= 17) * 100,
+  Prob_Descenso = rowMeans(resultados_sim >= 18) * 100
+)
+
+predMod2 <- predMod2[order(-predMod2$Media_Puntos), ]
+predMod2$Posicion <- 1:nrow(predMod2)
+predMod2 <- predMod2[, c("Posicion", "Equipo", "Media_Puntos", "Prob_Campeon", "Prob_UCL", "Prob_UEL", "Prob_UECL", "Prob_Mitad_Tabla", "Prob_Descenso")]
+
+kable(predMod2, format = "latex", 
+      caption = "Probabilidades de clasificación (Modelo 2)", 
+      booktabs = TRUE, row.names = FALSE, escape = TRUE, align = "c") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Realizamos la comparación con la clasificación real de la temporada 2023/2024 en las siguientes subsecciones.
+
+## Comparación de Posiciones
+
+Para evaluar la precisión del modelo, se compara la clasificación media predicha con la clasificación real al final de la temporada 2023/2024. En primer lugar, calculamos el error absoluto medio en las posiciones de los equipos y mostramos una tabla con los errores individuales. Finalmente, visualizamos gráficamente la relación entre las posiciones reales y las simuladas para analizar las desviaciones.
+
+```{r}
+comparacion <- merge(predMod2, clasificacion_real[, c("Equipo", "Posicion_Real")], by = "Equipo")
+error_posicion <- abs(comparacion$Posicion - comparacion$Posicion_Real)
+error_medio_posicion <- mean(error_posicion)
+#cat("Error medio de posiciones:", error_medio_posicion, "\n")
+```
+
+```{r tablaComparacionPosicionesMod2, results='asis'}
+comparacion_posiciones <- predMod2 %>%
+  select(Equipo, Posicion) %>% 
+  rename(Posicion_Predicha = Posicion) %>%
+  left_join(clasificacion_real %>% select(Equipo, Posicion_Real), by = "Equipo") %>%
+  mutate(Error_Posicion = abs(Posicion_Predicha - Posicion_Real)) %>%
+  arrange(Posicion_Predicha)  
+
+comparacion_posiciones %>%
+  kable(format = "latex", caption = "Comparación de Posiciones: Predichas vs Reales (Modelo 2)", booktabs = TRUE, row.names = FALSE, align = "c") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down", "condensed"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+```{r results='asis'}
+cat("El error absoluto medio entre las posiciones predichas y reales es:", round(error_medio_posicion, 2), "\n")
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Esto supone una mejora con respecto al modelo anterior (2,7), por tanto se puede llegar a la conclusión de que este segundo modelo produce mejores predicciones. Es decir, la función de ponderación temporal añadida ha provocado una mayor capacidad de ajuste al rendimiento real de los equipos. En particular, se acierta la posición de 3 equipos (Real Madrid, Barcelona y Getafe). Por otro lado, grandes errores de más de 3 posiciones solo se dan en dos equipos: Sevilla con un error de 5 posiciones, y Alavés con un error de 10 posiciones.
+
+```{r graficoComparacionPosicionesMod2, fig.cap="Comparación de posiciones Predichas vs Reales (Modelo 2)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+#library(ggplot2)
+
+ggplot(comparacion, aes(x = Posicion_Real, y = Posicion, label = Equipo)) +
+  geom_point(color = "blue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  geom_text(vjust = -0.5, size = 3) +
+  labs(title = "Comparación de Posiciones: Predichas vs Reales",
+       x = "Posición Real",
+       y = "Posición Predicha") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Se observa que todos los equipos excepto los mencionados Alavés y Sevilla están muy cerca de la diagonal, lo cual indica una alta concordancia entre las posiciones predichas y las reales, reflejando una mejora respecto al modelo anterior.
+
+## Comparación de Puntos
+
+Igual que antes, hacemos el mismo estudio con la predicción de los puntos de cada equipo.
+
+```{r}
+comparacion_puntos <- predMod2 %>%
+  select(Equipo, Media_Puntos) %>%
+  rename(Puntos_Predichos = Media_Puntos) %>%
+  left_join(clasificacion_real %>% select(Equipo, Puntos_Real), by = "Equipo") %>%
+  mutate(Error_Puntos = abs(Puntos_Predichos - Puntos_Real)) %>%
+  arrange(desc(Puntos_Predichos))  
+
+error_medio_puntos <- mean(comparacion_puntos$Error_Puntos)
+#cat("Error medio de puntos:", error_medio_puntos, "\n")
+```
+
+```{r tablaComparacionPuntosMod2, results='asis'}
+comparacion_puntos %>%
+  kable(format = "latex", caption = "Comparación de Puntos: Predichos vs Reales (Modelo 2)", booktabs = TRUE, row.names = FALSE, align = "c") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down", "condensed"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+```{r results='asis'}
+cat("El error absoluto medio entre los puntos predichos y reales es:", round(error_medio_puntos, 2), "\n")
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Frente al error del modelo 1, que era de 8'94, se refuerza la idea de que el presente modelo ofrece una mejor capacidad predictiva. Se observa que este modelo prácticamente acierta el puntaje de equipos como la Real Sociedad, Valencia, Osasuna, Mallorca y Betis.
+
+```{r graficoComparacionPuntosMod2, fig.cap="Comparación de puntos Predichos vs Reales (Modelo 2)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+# Gráfico de comparación de puntos
+ggplot(comparacion_puntos, aes(x = Puntos_Real, y = Puntos_Predichos, label = Equipo)) +
+  geom_point(color = "blue", size = 3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  geom_text(vjust = -0.5, size = 3) +
+  labs(title = "Comparación de Puntos Predichos vs Reales",
+       x = "Puntos Reales",
+       y = "Puntos Predichos") +
+  coord_fixed() +  
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+El gráfico es similar al producido por el modelo 1, pues los mayores errores de predicción se concentran en los mismos equipos (Granada, Sevilla, Almería, Real Madrid, Girona). Esto sugiere que, aunque el modelo 2 mejora claramente la estimación de puntos, ambos comparten ciertas debilidades.
+
+## Estrategia de apuestas
+
+Dado que este modelo ha demostrado ser el más preciso entre los modelos basados en Poisson (Modelos 1, 2 y 3), se utiliza también para desarrollar una estrategia de apuestas. Esta estrategia consiste en apostar una unidad monetaria en cada uno de los partidos de la temporada al resultado más frecuente obtenido a partir de las 1000 simulaciones, en formato 1X2 (victoria local, empate o victoria visitante). Tal como se explicó previamente, la rentabilidad de la estrategia se evaluará utilizando las cuotas ofrecidas por la casa de apuestas Bet365.
+
+```{r}
+resultado_frecuente <- character(nrow(goles_local_mat))
+
+for (i in 1:nrow(goles_local_mat)) {
+  resultados <- character(n_simulaciones)
+  for (j in 1:n_simulaciones) {
+    g_local <- goles_local_mat[i, j]
+    g_visit <- goles_visit_mat[i, j]
+    
+    if (g_local > g_visit) {
+      resultados[j] <- "Victoria Local"
+    } else if (g_local < g_visit) {
+      resultados[j] <- "Victoria Visitante"
+    } else {
+      resultados[j] <- "Empate"
+    }
+  }
+  resultado_frecuente[i] <- names(which.max(table(resultados)))
+}
+
+  resultados_Mod2 <- data.frame(
+  Partido = partidos_id,
+  Resultado_Predicho = resultado_frecuente
+)
+```
+
+```{r results='asis'}
+datos_apuesta_2 <- bind_cols(resultados_Mod2, cuotas_23_24)
+
+datos_apuesta_2 <- datos_apuesta_2 %>% select(Resultado, Resultado_Predicho, Cuota_Victoria_Local, Cuota_Empate, Cuota_Victoria_Visitante)
+
+# Aplicamos la función a cada fila del dataframe
+datos_apuesta_2$Ganancia <- mapply(simular_apuesta,
+                                    datos_apuesta_2$Resultado_Predicho,
+                                    datos_apuesta_2$Resultado,
+                                    datos_apuesta_2$Cuota_Victoria_Local,
+                                    datos_apuesta_2$Cuota_Empate,
+                                    datos_apuesta_2$Cuota_Victoria_Visitante)
+
+# Ganancia total
+ganancia_total <- sum(datos_apuesta_2$Ganancia, na.rm = TRUE)
+
+# ROI: Return on Investment, Retorno sobre la Inversión
+ri <- ganancia_total / nrow(datos_apuesta_2)
+
+#cat("Ganancia total: ", ganancia_total, "\n")
+#cat("Retorno de la inversión (ROI): ", ri*100, "%\n")
+cat(paste0("\\textbf{Ganancia neta total:} ", round(ganancia_total, 2), "\n"))
+```
+
+```{r results='asis'}
+cat(paste0("\\textbf{Retorno de la inversión (ROI):} ", round(ri * 100, 2), "\\%\n"))
+```
+
+La ganancia neta obtenida es de 16,99€. Por tanto, hemos desarrollado un modelo que genera un retorno económico positivo para temporada 2023/2024. El retorno económico (ROI) sobre el dinero total apostado es del 4,47%.
+
+Ahora realizaremos un análisis de las ganancias obtenidas por cada tipo de apuesta: 'Victoria Local', 'Empate' y 'Victoria Visitante'.
+
+```{r tablaTipoApuestaMod2, results='asis'}
+# Calculamos estadísticas por tipo de apuesta
+resumen_apuestas <- datos_apuesta_2 %>%
+  group_by(Resultado_Predicho) %>%
+  summarise(
+    Apuestas = n(),
+    Ganancia_Total = sum(Ganancia, na.rm = TRUE),
+    ROI = Ganancia_Total / Apuestas
+  ) %>%
+  arrange(desc(ROI))
+
+resumen_apuestas %>%
+  kable(format = "latex", caption = "Ganancias por tipo de apuesta (Modelo 2)", booktabs = TRUE, row.names = FALSE, align = "c", digits = 2) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down", "condensed"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+```{r grafTipoApuestaMod2, fig.cap="Ganancias por tipo de apuesta (Modelo 2)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+ggplot(resumen_apuestas, aes(x = Resultado_Predicho, y = ROI, fill = Resultado_Predicho)) +
+  geom_bar(stat = "identity") +
+  labs(title = "ROI por Tipo de Apuesta", x = "Tipo de Apuesta", y = "ROI") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+El beneficio total generado por las apuestas a empates es del 60% sobre el dinero total apostado a dicho resultado, lo cual es una cantidad muy destacable en comparación con los otros dos tipos de apuesta. En el otro extremo se encuentran las apuestas al resultado "Victoria Local", las cuales no generan ningún beneficio, por lo que con este modelo no es muy recomendable apostar a las victorias locales cuando el modelo lo predice.
+
+Hacemos ahora un análisis por rangos de cuotas, los cuales son los siguientes:
+
+-   Bajas: Cuotas entre 1.00 y 1.50
+-   Medias: Cuotas entre 1.51 y 2.00
+-   Altas: Cuotas entre 2.01 y 3.00
+-   Muy Altas: Cuotas superiores a 3.00
+
+```{r tablaCuotaMod2, results='asis'}
+datos_apuesta_2 <- datos_apuesta_2 %>%
+  mutate(Cuota_Predicha = case_when(
+    Resultado_Predicho == "Victoria Local" ~ Cuota_Victoria_Local,
+    Resultado_Predicho == "Empate" ~ Cuota_Empate,
+    Resultado_Predicho == "Victoria Visitante" ~ Cuota_Victoria_Visitante,
+    TRUE ~ NA_real_
+  ))
+
+datos_apuesta_2 <- datos_apuesta_2 %>%
+  mutate(Rango_Cuota = cut(
+    Cuota_Predicha,
+    breaks = c(0, 1.5, 2, 3, Inf),
+    labels = c("Bajas", "Medias", "Altas", "Muy Altas"),
+    right = FALSE
+  ))
+
+resumen_cuotas <- datos_apuesta_2 %>%
+  group_by(Rango_Cuota) %>%
+  summarise(
+    Apuestas = n(),
+    Ganancia_Total = sum(Ganancia, na.rm = TRUE),
+    ROI = Ganancia_Total / Apuestas
+  ) %>%
+  arrange(desc(ROI))
+
+resumen_cuotas %>%
+  kable(format = "latex", caption = "Ganancias por rango de cuotas (Modelo 2)", booktabs = TRUE, row.names = FALSE, align = "c", digits = 2) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down", "condensed"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+```{r grafCuotaMod2, fig.cap="Ganancias por rango de cuotas (Modelo 2)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+
+ggplot(resumen_cuotas, aes(x = Rango_Cuota, y = ROI, fill = Rango_Cuota)) +
+  geom_bar(stat = "identity") +
+  labs(title = "ROI por Rango de Cuota", x = "Rango de Cuota", y = "ROI") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+En este caso vemos que cuando el modelo recomienda apuestas a cuotas muy altas (superiores a 3€ por euro apostado), el retorno económico obtenido sobre el dinero total apostado en este tipo de apuestas es superior al 50%. Por tanto, sería muy recomendable hacer caso al modelo cuando predice resultados con este tipo de cuotas. Por otro lado, apuestas a resultados con cuotas medias y altas no generan prácticamente ningún beneficio.
+
+A continuación, analizamos el desempeño de cada equipo por separado, según jueguen como local o como visitante. Cabe destacar que cada equipo juega 19 partidos como local y otros 19 como visitante a lo largo del campeonato.
+
+```{r}
+datos_apuesta_2$EquipoLocal <- datos23_24$EquipoLocal
+datos_apuesta_2$EquipoVisitante <- datos23_24$EquipoVisitante
+
+# Calculamos estadísticas por equipo local
+resumen_local <- datos_apuesta_2 %>%
+  group_by(EquipoLocal) %>%
+  summarise(
+    Apuestas = n(),
+    Ganancia_Total = round(sum(Ganancia, na.rm = TRUE),2),
+    ROI = Ganancia_Total / Apuestas
+  ) %>%
+  arrange(desc(ROI))
+
+# Calculamos estadísticas por equipo visitante
+resumen_visitante <- datos_apuesta_2 %>%
+  group_by(EquipoVisitante) %>%
+  summarise(
+    Apuestas = n(),
+    Ganancia_Total = sum(Ganancia, na.rm = TRUE),
+    ROI = Ganancia_Total / Apuestas
+  ) %>%
+  arrange(desc(ROI))
+```
+
+```{r grafEquipoLocalMod2, fig.cap="Ganancias por equipo local (Modelo 2)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+ggplot(resumen_local, aes(x = reorder(EquipoLocal, ROI), y = ROI, fill = EquipoLocal)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "ROI por Equipo Local", x = "Equipo Local", y = "ROI") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Cuando juegan como local, los equipos que generan un mayor retorno económico son el Alavés, el Girona, el Osasuna y el Atlético de Madrid, obteniéndose ganancias netas alrededor del 35% del dinero total apostado en los 19 partidos que cada uno disputó en casa, las cuales son cifras bastante altas. En cambio, equipos como Sevilla, Almería y Las Palmas producen pérdidas de más del 35% sobre lo apostado.
+
+```{r grafEquipoVisitMod2, fig.cap="Ganancias por equipo visitante (Modelo 2)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+
+# Gráfico del ROI por equipo visitante
+ggplot(resumen_visitante, aes(x = reorder(EquipoVisitante, ROI), y = ROI, fill = EquipoVisitante)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "ROI por Equipo Visitante", x = "Equipo Visitante", y = "ROI") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Por otro lado, cuando juegan a domicilio, Las Palmas genera un retorno económico de aproximadamente el 70%, una cantidad realmente alta. Seguidamente aparecen Granada, Real Madrid y Real Sociedad, con retornos alrededor del 25%, respectivamente. Son cifras muy inferiores a la de Las Palmas, pero siguen siendo algo relevantes. En el lado opuesto se encuentra el Villarreal, generando pérdidas que superan el 35%, y el Betis, con pérdidas cercanas al 25%.
+
+# Modelo 3: Modelo de Poisson bivariado
+
+Tras haber trabajado con modelos de Poisson donde los goles del equipo local y visitante se consideraban independientes (Modelos 1 y 2), en este modelo basado en la distribución de Poisson bivariada se incorpora una posible correlación entre ambos marcadores a través de un nuevo parámetro que representa la covarianza, al que denominaremos $\beta^{cte}$. Esta dependencia puede capturar mejor ciertas dinámicas dentro de un partido.
+
+La estructura del modelo es parecida a los anteriores, manteniendo los parámetros de habilidades ofensivas ($Ataque$), defensivas ($Defensa$) y la ventaja de jugar en casa ($Home$), además de la introducción de un nuevo parámetro constante, denominado $\mu$.
+
+Los parámetros $\beta^{cte}$, $Home$ y $\mu$ se estiman para la primera jornada y no cambian durante la temporada, pues se presuponen constantes (y así se reduce el tiempo de cómputo), mientras que los parámetros $Ataque$ y $Defensa$ se van estimando jornada a jornada, con el fin de capturar la evolución de los equipos a lo largo de la temporada. En la siguiente tabla se muestran los parámetros estimados en la primera jornada para 10 equipos:
+
+```{r}
+#library(Rcpp)
+sourceCpp("suma_factoriales.cpp")
+```
+
+```{r TablaHabilidadesMod3, results='asis'}
+# Función de ponderación temporal
+peso_temporal <- function(delta_t, lambda_w) {
+  exp(-lambda_w * delta_t)  
+}
+
+equipos <- unique(c(datos$EquipoLocal, datos$EquipoVisitante, datos23_24$EquipoLocal, datos23_24$EquipoVisitante))
+n_equipos <- length(equipos)
+
+resultados_jornadas <- list()
+
+log_verosimilitud <- function(params, X_ij, Y_ij, equipos_idx_local, equipos_idx_visitante, tiempo, lambda_w) {
+  att <- params[1:n_equipos]  
+  def <- params[(n_equipos + 1):(2 * n_equipos)]  
+  mu <- params[2 * n_equipos + 1]  
+  home <- params[2 * n_equipos + 2] 
+  beta_cte <- params[2 * n_equipos + 3]  
+
+  lambda3 <- exp(beta_cte)
+  logL <- 0
+
+  for (i in 1:length(X_ij)) {
+    lambda1 <- exp(mu + home + att[equipos_idx_local[i]] + def[equipos_idx_visitante[i]])
+    lambda2 <- exp(mu + att[equipos_idx_visitante[i]] + def[equipos_idx_local[i]])
+
+    goles_local <- X_ij[i]
+    goles_visitante <- Y_ij[i]
+
+    suma_k <- suma_factoriales(goles_local, goles_visitante, lambda1, lambda2, lambda3)
+
+    peso <- peso_temporal(tiempo[i], lambda_w)
+
+    logL <- logL + peso * (-(lambda1 + lambda2 + lambda3) +
+                           goles_local * log(lambda1 + 1e-10) +
+                           goles_visitante * log(lambda2 + 1e-10) +
+                           log(suma_k + 1e-10))
+  }
+
+  return(-logL)
+}
+
+# Jornada 1 (estimación completa) 
+partidos_hasta_j1 <- datos
+
+X_ij <- partidos_hasta_j1$GolesLocal
+Y_ij <- partidos_hasta_j1$GolesVisitante
+equipos_idx_local <- match(partidos_hasta_j1$EquipoLocal, equipos)
+equipos_idx_visitante <- match(partidos_hasta_j1$EquipoVisitante, equipos)
+
+fecha_num <- as.numeric(partidos_hasta_j1$Fecha)
+fecha_actual <- max(fecha_num)
+tiempo <- fecha_actual - fecha_num
+
+lambda_w <- 0.00186
+
+params_iniciales <- c(rep(0, n_equipos), rep(0, n_equipos), 0, 0, 0)
+
+suppressWarnings(
+  optim_result <- optim(params_iniciales, log_verosimilitud,
+                        X_ij = X_ij,
+                        Y_ij = Y_ij,
+                        equipos_idx_local = equipos_idx_local,
+                        equipos_idx_visitante = equipos_idx_visitante,
+                        tiempo = tiempo,
+                        lambda_w = lambda_w,
+                        method = "BFGS",
+                        control = list(maxit = 1000, reltol = 1e-8))
+)
+
+params_optim <- optim_result$par
+att_optim <- params_optim[1:n_equipos]
+def_optim <- params_optim[(n_equipos + 1):(2 * n_equipos)]
+mu_optim <- params_optim[2 * n_equipos + 1]
+home_optim <- params_optim[2 * n_equipos + 2]
+beta_cte_optim <- params_optim[2 * n_equipos + 3]
+
+mu_fijo <- mu_optim
+home_fijo <- home_optim
+beta_cte_fijo <- beta_cte_optim
+
+idx_lp <- which(equipos == "Las Palmas")
+idx_granada <- which(equipos == "Granada")
+idx_alaves <- which(equipos == "Alaves")
+
+att_optim[idx_lp] <- mean(c(att_optim[idx_granada], att_optim[idx_alaves]))
+def_optim[idx_lp] <- mean(c(def_optim[idx_granada], def_optim[idx_alaves]))
+
+# Jornada 1
+habilidades_j1 <- data.frame(
+  Jornada = 1,
+  Equipo = equipos,
+  Ataque = att_optim,
+  Defensa = def_optim,
+  Mu = mu_optim,
+  Home = home_optim,
+  Beta_Cte = beta_cte_optim
+)
+resultados_jornadas[[1]] <- habilidades_j1
+
+log_verosimilitud_fijo <- function(params, X_ij, Y_ij, equipos_idx_local, equipos_idx_visitante, tiempo, lambda_w, mu, home, beta_cte) {
+  att <- params[1:n_equipos]
+  def <- params[(n_equipos + 1):(2 * n_equipos)]
+  lambda3 <- exp(beta_cte)
+  logL <- 0
+
+  for (i in 1:length(X_ij)) {
+    lambda1 <- exp(mu + home + att[equipos_idx_local[i]] + def[equipos_idx_visitante[i]])
+    lambda2 <- exp(mu + att[equipos_idx_visitante[i]] + def[equipos_idx_local[i]])
+    goles_local <- X_ij[i]
+    goles_visitante <- Y_ij[i]
+
+    suma_k <- suma_factoriales(goles_local, goles_visitante, lambda1, lambda2, lambda3)
+    peso <- peso_temporal(tiempo[i], lambda_w)
+
+    logL <- logL + peso * (-(lambda1 + lambda2 + lambda3) +
+                           goles_local * log(lambda1 + 1e-10) +
+                           goles_visitante * log(lambda2 + 1e-10) +
+                           log(suma_k + 1e-10))
+  }
+
+  return(-logL)
+}
+
+# Resto de jornadas (estimamos solo att y def)
+for (j in 2:max(datos23_24$Jornada)) {
+  #cat("Estimando jornada", j, "...\n")
+
+  partidos_hasta_j <- bind_rows(
+    datos,
+    datos23_24 %>% filter(Jornada < j)
+  )
+
+  X_ij <- partidos_hasta_j$GolesLocal
+  Y_ij <- partidos_hasta_j$GolesVisitante
+  equipos_idx_local <- match(partidos_hasta_j$EquipoLocal, equipos)
+  equipos_idx_visitante <- match(partidos_hasta_j$EquipoVisitante, equipos)
+
+  fecha_num <- as.numeric(partidos_hasta_j$Fecha)
+  fecha_actual <- max(fecha_num)
+  tiempo <- fecha_actual - fecha_num
+
+  params_iniciales <- c(att_optim, def_optim)
+
+  suppressWarnings(
+    optim_result <- optim(params_iniciales, log_verosimilitud_fijo,
+                          X_ij = X_ij,
+                          Y_ij = Y_ij,
+                          equipos_idx_local = equipos_idx_local,
+                          equipos_idx_visitante = equipos_idx_visitante,
+                          tiempo = tiempo,
+                          lambda_w = lambda_w,
+                          mu = mu_fijo,
+                          home = home_fijo,
+                          beta_cte = beta_cte_fijo,
+                          method = "BFGS",
+                          control = list(maxit = 1000, reltol = 1e-8))
+  )
+
+  params_optim <- optim_result$par
+  att_optim <- params_optim[1:n_equipos]
+  def_optim <- params_optim[(n_equipos + 1):(2 * n_equipos)]
+
+  habilidades_j <- data.frame(
+    Jornada = j,
+    Equipo = equipos,
+    Ataque = att_optim,
+    Defensa = def_optim,
+    Mu = mu_fijo,
+    Home = home_fijo,
+    Beta_Cte = beta_cte_fijo
+  )
+
+  resultados_jornadas[[j]] <- habilidades_j
+}
+
+habilidades_por_jornada <- bind_rows(resultados_jornadas)
+
+kable(head(habilidades_por_jornada, 10), format = "latex", caption = "Habilidades estimadas Jornada 1 (Modelo 3)", booktabs = TRUE, row.names = FALSE, escape = TRUE, align = "c",digits = 3) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+De forma similar a los dos modelos que preceden, se representa la evolución de la habilidad ofensiva y defensiva estimada a lo largo de las jornadas para cinco equipos seleccionados: Real Madrid, Barcelona, Atlético de Madrid, Betis y Granada.
+
+```{r grafHabOfensivaMod3, fig.cap="Evolución de la habilidad ofensiva (Modelo 3)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+#library(ggplot2)
+equipos_grafico <- c("Real Madrid", "Barcelona", "Ath Madrid", "Betis", "Granada")
+
+# Filtramos los equipos seleccionados
+df_grafico <- habilidades_por_jornada %>%
+  filter(Equipo %in% equipos_grafico)
+
+# Gráfico de evolución ofensiva
+ggplot(df_grafico, aes(x = Jornada, y = Ataque, color = Equipo)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 1) +
+  labs(title = "Evolución de la Habilidad Ofensiva",
+       x = "Jornada",
+       y = "Ataque") +
+  theme_minimal() +
+  theme(legend.position = "top", plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+```{r grafHabDefensivaMod3, fig.cap="Evolución de la habilidad defensiva (Modelo 3)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+
+# Gráfico de evolución defensiva
+ggplot(df_grafico, aes(x = Jornada, y = Defensa, color = Equipo)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 1) +
+  labs(title = "Evolución de la Habilidad Defensiva",
+       x = "Jornada",
+       y = "Defensa") +
+  theme_minimal() +
+  theme(legend.position = "top", plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+En este caso, los valores de los parámetros se sitúan en un rango diferente, con una distribución más centrada en torno al cero. Como era de esperar, el Real Madrid evoluciona positivamente a lo largo de la temporada, consolidándose como el mejor equipo tanto ofensiva como defensivamente durante buena parte del campeonato.
+
+A continuación, se muestra el resto de parámetros del modelo:
+
+```{r results='asis'}
+cat("\\textbf{Parámetro $\\mu$:} ", round(habilidades_por_jornada$Mu[1], 3), "\n")
+```
+
+```{r results='asis'}
+cat("\\textbf{Ventaja de jugar en casa (Home):} ", round(habilidades_por_jornada$Home[1], 3), "\n")
+```
+
+```{r results='asis'}
+cat("\\textbf{Parámetro de covarianza $\\beta^{cte}$:} ", round(habilidades_por_jornada$Beta_Cte[1], 3), "\n")
+```
+
+Partiendo de los parámetros estimados previamente, se procede a realizar 1000 simulaciones de la temporada 2023/2024, obteniéndose la siguiente tabla:
+
+```{r ClasificacionMod3, results='asis'}
+set.seed(10)
+n_simulaciones <- 1000
+
+equipos <- unique(c(datos23_24$EquipoLocal, datos23_24$EquipoVisitante))
+n_equipos <- length(equipos)
+jornadas <- sort(unique(datos23_24$Jornada))
+
+resultados_sim <- matrix(0, nrow = n_equipos, ncol = n_simulaciones)
+puntos_sim <- matrix(0, nrow = n_equipos, ncol = n_simulaciones)
+
+# Función para simular goles con Poisson bivariada
+generar_poisson_bivariada <- function(lambda1, lambda2, lambda3) {
+  k <- rpois(1, lambda3)
+  x <- rpois(1, lambda1) + k
+  y <- rpois(1, lambda2) + k
+  return(c(x, y))
+}
+
+for (sim in 1:n_simulaciones) {
+  #if (sim %% 100 == 0) cat("Simulación", sim, "de", n_simulaciones, "\n")
+  
+  clasificacion <- data.frame(
+    Equipo = equipos, Puntos = 0, PJ = 0, PG = 0, PE = 0, PP = 0, GF = 0, GC = 0, stringsAsFactors = FALSE
+  )
+  
+  for (j in jornadas) {
+    partidos_jornada <- datos23_24 %>% filter(Jornada == j)
+    habilidades_j <- habilidades_por_jornada %>% filter(Jornada == j)
+    
+    idx_local <- match(partidos_jornada$EquipoLocal, habilidades_j$Equipo)
+    idx_visit <- match(partidos_jornada$EquipoVisitante, habilidades_j$Equipo)
+    
+    alpha_local <- habilidades_j$Ataque[idx_local]
+    beta_visit <- habilidades_j$Defensa[idx_visit]
+    alpha_visit <- habilidades_j$Ataque[idx_visit]
+    beta_local <- habilidades_j$Defensa[idx_local]
+    
+    mu <- habilidades_j$Mu[1]
+    home <- habilidades_j$Home[1]
+    beta_cte <- habilidades_j$Beta_Cte[1]
+    
+    lambda1 <- exp(mu + home + alpha_local + beta_visit)
+    lambda2 <- exp(mu + alpha_visit + beta_local)
+    lambda3 <- exp(beta_cte)
+    
+    for (i in 1:nrow(partidos_jornada)) {
+      equipo_local <- partidos_jornada$EquipoLocal[i]
+      equipo_visit <- partidos_jornada$EquipoVisitante[i]
+      
+      goles <- generar_poisson_bivariada(lambda1[i], lambda2[i], lambda3)
+      g_local <- goles[1]
+      g_visit <- goles[2]
+      
+      idx_l <- match(equipo_local, equipos)
+      idx_v <- match(equipo_visit, equipos)
+      
+      clasificacion$PJ[idx_l] <- clasificacion$PJ[idx_l] + 1
+      clasificacion$PJ[idx_v] <- clasificacion$PJ[idx_v] + 1
+      clasificacion$GF[idx_l] <- clasificacion$GF[idx_l] + g_local
+      clasificacion$GF[idx_v] <- clasificacion$GF[idx_v] + g_visit
+      clasificacion$GC[idx_l] <- clasificacion$GC[idx_l] + g_visit
+      clasificacion$GC[idx_v] <- clasificacion$GC[idx_v] + g_local
+      
+      if (g_local > g_visit) {
+        clasificacion$Puntos[idx_l] <- clasificacion$Puntos[idx_l] + 3
+        clasificacion$PG[idx_l] <- clasificacion$PG[idx_l] + 1
+        clasificacion$PP[idx_v] <- clasificacion$PP[idx_v] + 1
+      } else if (g_local < g_visit) {
+        clasificacion$Puntos[idx_v] <- clasificacion$Puntos[idx_v] + 3
+        clasificacion$PG[idx_v] <- clasificacion$PG[idx_v] + 1
+        clasificacion$PP[idx_l] <- clasificacion$PP[idx_l] + 1
+      } else {
+        clasificacion$Puntos[idx_l] <- clasificacion$Puntos[idx_l] + 1
+        clasificacion$Puntos[idx_v] <- clasificacion$Puntos[idx_v] + 1
+        clasificacion$PE[idx_l] <- clasificacion$PE[idx_l] + 1
+        clasificacion$PE[idx_v] <- clasificacion$PE[idx_v] + 1
+      }
+    }
+  }
+  
+  clasificacion <- clasificacion[order(-clasificacion$Puntos, -(clasificacion$GF - clasificacion$GC)), ]
+  resultados_sim[, sim] <- order(match(clasificacion$Equipo, equipos))
+  puntos_sim[, sim] <- clasificacion$Puntos[match(equipos, clasificacion$Equipo)]
+}
+
+# Estadísticas finales
+predMod3 <- data.frame(
+  Equipo = equipos,
+  Media_Puntos = rowMeans(puntos_sim),
+  Prob_Campeon = rowMeans(resultados_sim == 1) * 100,
+  Prob_UCL = rowMeans(resultados_sim <= 4) * 100,
+  Prob_UEL = rowMeans(resultados_sim >= 5 & resultados_sim <= 6) * 100,
+  Prob_UECL = rowMeans(resultados_sim == 7) * 100,
+  Prob_Mitad_Tabla = rowMeans(resultados_sim >= 8 & resultados_sim <= 17) * 100,
+  Prob_Descenso = rowMeans(resultados_sim >= 18) * 100
+)
+
+predMod3 <- predMod3[order(-predMod3$Media_Puntos), ]
+predMod3$Posicion <- 1:nrow(predMod3)
+predMod3 <- predMod3[, c("Posicion", "Equipo", "Media_Puntos", "Prob_Campeon", "Prob_UCL", "Prob_UEL", "Prob_UECL", "Prob_Mitad_Tabla", "Prob_Descenso")]
+
+kable(predMod3, format = "latex", 
+      caption = "Probabilidades de clasificación (Modelo 3)", 
+      booktabs = TRUE, row.names = FALSE, escape = TRUE, align = "c") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Se obtiene una clasificación muy similar a la generada por el Modelo 2, que asume independencia entre los goles de ambos equipos. Por tanto, el uso de la Poisson bivariada además de no mejorar notablemente la capacidad predictiva, implica un mayor coste computacional. En consecuencia, resulta más conveniente optar por el modelo anterior, que combina simplicidad, eficiencia y buenos resultados al incorporar además la función de ponderación temporal.
+
+## Comparación de Posiciones
+
+```{r}
+comparacion <- merge(predMod3, clasificacion_real[, c("Equipo", "Posicion_Real")], by = "Equipo")
+error_posicion <- abs(comparacion$Posicion - comparacion$Posicion_Real)
+error_medio_posicion <- mean(error_posicion)
+#cat("Error medio de posiciones:", error_medio_posicion, "\n")
+```
+
+La tabla de errores en las posiciones es la siguiente:
+
+```{r tablaComparacionPosicionesMod3, results='asis'}
+#library(dplyr)
+comparacion_posiciones <- predMod3 %>%
+  select(Equipo, Posicion) %>% 
+  rename(Posicion_Predicha = Posicion) %>%
+  left_join(clasificacion_real %>% select(Equipo, Posicion_Real), by = "Equipo") %>%
+  mutate(Error_Posicion = abs(Posicion_Predicha - Posicion_Real)) %>%
+  arrange(Posicion_Predicha)  
+
+comparacion_posiciones %>%
+  kable(format = "latex", caption = "Comparación de Posiciones: Predichas vs Reales", booktabs = TRUE, row.names = FALSE, align = "c") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down", "condensed"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+```{r results='asis'}
+cat("El error absoluto medio entre las posiciones predichas y reales es:", round(error_medio_posicion, 2), "\n")
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Esencialmente igual al modelo anterior. Por tanto, el gráfico también tendrá un comportamiento similar.
+
+```{r graficoComparacionPosicionesMod3, fig.cap="Comparación de posiciones Predichas vs Reales (Modelo 3)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+#library(ggplot2)
+ggplot(comparacion, aes(x = Posicion_Real, y = Posicion, label = Equipo)) +
+  geom_point(color = "blue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  geom_text(vjust = -0.5, size = 3) +
+  labs(title = "Comparación de Posiciones Simuladas vs Reales",
+       x = "Posición Real",
+       y = "Posición Simulada") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+## Comparación de Puntos
+
+En línea con lo observado anteriormente, los resultados del análisis del error en la predicción de puntos serán muy parecidos a los del Modelo 2, aunque hay algo de mejora. A continuación, se presentan los detalles:
+
+```{r}
+comparacion_puntos <- predMod3 %>%
+  select(Equipo, Media_Puntos) %>%
+  rename(Puntos_Predichos = Media_Puntos) %>%
+  left_join(clasificacion_real %>% select(Equipo, Puntos_Real), by = "Equipo") %>%
+  mutate(Error_Puntos = abs(Puntos_Predichos - Puntos_Real)) %>%
+  arrange(desc(Puntos_Predichos))  # Ordenar por puntos predichos
+
+error_medio_puntos <- mean(comparacion_puntos$Error_Puntos)
+#cat("Error medio de puntos:", error_medio_puntos, "\n")
+```
+
+```{r tablaComparacionPuntosMod3, results='asis'}
+comparacion_puntos %>%
+  kable(format = "latex", caption = "Comparación de Puntos: Predichos vs Reales", booktabs = TRUE, row.names = FALSE, align = "c") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down", "condensed"))
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+```{r results='asis'}
+cat("El error absoluto medio entre los puntos predichos y reales es:", round(error_medio_puntos, 2), "\n")
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Se obtienen puntajes similares a los del modelo 2.
+
+```{r graficoComparacionPuntosMod3, fig.cap="Comparación de puntos Predichos vs Reales (Modelo 3)", fig.pos='!htbp', fig.align='center', out.width='0.6\\linewidth', results='asis'}
+# Gráfico de comparación de puntos
+ggplot(comparacion_puntos, aes(x = Puntos_Real, y = Puntos_Predichos, label = Equipo)) +
+  geom_point(color = "blue", size = 3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  geom_text(vjust = -0.5, size = 3) +
+  labs(title = "Comparación de Puntos Predichos vs Reales",
+       x = "Puntos Reales",
+       y = "Puntos Predichos") +
+  coord_fixed() +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+```{r results='asis'}
+cat("\\FloatBarrier")
+```
+
+Como es de esperar, se observa un gráfico prácticamente igual al obtenido en el modelo anterior.
