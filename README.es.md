@@ -1,6 +1,6 @@
 # Métodos estadísticos para la predicción de resultados en el fútbol
 
-> 🇬🇧 \[English version](README.md)
+[English version](README.md)
 
 Trabajo de Fin de Grado — Doble Grado en Matemáticas y Estadística, Universidad de Sevilla (2024–2025).
 
